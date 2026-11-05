@@ -1,0 +1,105 @@
+[
+  {
+    "address" : "2001:da8:e000:7705:7087:cd20:8ec8:2e20",
+    "enabled" : true,
+    "id" : "CAEDDB3F-AB8E-4668-A844-EDE41596147C",
+    "name" : "2004-zju-ipv6",
+    "sources" : [
+      "~\/.ssh\/config:234"
+    ]
+  },
+  {
+    "address" : "2001:da8:e000:7705:1b0e:6aa5:5e0f:f0dc",
+    "enabled" : true,
+    "id" : "6DA259DA-9BF2-49CE-AC28-0E468A6600D6",
+    "name" : "2204-zju-ipv6",
+    "sources" : [
+      "~\/.ssh\/config:223"
+    ]
+  },
+  {
+    "address" : "2001:da8:e000:7705:8bbd:c4c4:8713:929",
+    "enabled" : true,
+    "id" : "B1C51D5D-ACA6-484C-9382-38E60A5CFE45",
+    "name" : "3090B-zju-ipv6",
+    "sources" : [
+      "~\/.ssh\/config:271"
+    ]
+  },
+  {
+    "address" : "2001:da8:e000:7705:a01c:4613:f4bf:117f",
+    "enabled" : true,
+    "id" : "C66F6D5E-AA13-4D0F-A5FE-6C298D1C16BF",
+    "name" : "3090C",
+    "sources" : [
+      "~\/.ssh\/config:282"
+    ]
+  },
+  {
+    "address" : "2001:da8:e000:7705:1f98:ac23:aff8:5e66",
+    "enabled" : true,
+    "id" : "C48EE875-1D14-4811-A485-D762EDF2FC1E",
+    "name" : "4090-new-ipv6",
+    "sources" : [
+      "~\/.ssh\/config:162"
+    ]
+  },
+  {
+    "address" : "2408:8642:891:80:2b7:3bf4:afba:4af5",
+    "enabled" : true,
+    "id" : "F9F122F9-23AA-4C0F-B3F9-5CB51F864FAD",
+    "name" : "abyss-xie",
+    "sources" : [
+      "~\/.ssh\/config:792"
+    ]
+  },
+  {
+    "address" : "2001:da8:e000:7705:ce4:da7e:5bd3:8b7a",
+    "enabled" : true,
+    "id" : "DAAF05A8-E3A0-4BFB-BD05-F49DBCA25B45",
+    "name" : "clawd、clawd_dky、clawd_orin、clawd_Starry",
+    "sources" : [
+      "~\/.ssh\/config:2",
+      "~\/.ssh\/config:18",
+      "~\/.ssh\/config:399",
+      "~\/.ssh\/config:329"
+    ]
+  },
+  {
+    "address" : "2001:da8:e000:7705:f39f:1a9f:8e6:c258",
+    "enabled" : true,
+    "id" : "D825B0C6-7154-4AA4-AAAB-253345BA8B02",
+    "name" : "HHY-BJB、HHY-BJB-wsl",
+    "sources" : [
+      "~\/.ssh\/config:250",
+      "~\/.ssh\/config:259"
+    ]
+  },
+  {
+    "address" : "240e:390:705e:8dc0::b46",
+    "enabled" : true,
+    "id" : "0C4ADF3F-8191-4C8C-A880-FBB49D9EB1D0",
+    "name" : "nas-2048-ipv6",
+    "sources" : [
+      "~\/.ssh\/config:294"
+    ]
+  },
+  {
+    "address" : "2001:da8:e000:7705:604c:d791:cbad:d041",
+    "enabled" : true,
+    "id" : "9BAB90C8-F003-4C7E-BAAC-9CF7C562D05A",
+    "name" : "Robotctl",
+    "sources" : [
+      "~\/.ssh\/config:193"
+    ]
+  },
+  {
+    "address" : "2001:da8:e000:7705:3c2:d88:797f:1c81",
+    "enabled" : true,
+    "id" : "62447955-2E48-44BF-A951-6A0E3F346D1D",
+    "name" : "ZSL_618",
+    "sources" : [
+      "~\/.ssh\/config:209"
+    ]
+  }
+]
