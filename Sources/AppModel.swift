@@ -429,7 +429,7 @@ final class AppModel: ObservableObject {
         if !helperReady { statusText = "尚未启用路由管理" }
     }
 
-    private func log(_ message: String) {
+    func log(_ message: String) {
         let stamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
         logLines.insert("\(stamp)  \(message)", at: 0)
         if logLines.count > 100 { logLines.removeLast(logLines.count - 100) }

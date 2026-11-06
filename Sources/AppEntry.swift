@@ -22,9 +22,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct IPv6WhitelistApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
     @StateObject private var model = AppModel.shared
+    @StateObject private var sshSync = SSHSyncModel.shared
     var body: some Scene {
         Window("IPv6 白名单", id: "main") {
-            MainView(model: model)
+            MainView(model: model, sshSync: sshSync)
                 .frame(minWidth: 990, minHeight: 760)
         }
         .defaultSize(width: 1120, height: 840)

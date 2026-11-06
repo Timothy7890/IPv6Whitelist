@@ -10,8 +10,9 @@ xcrun swiftc -swift-version 5 -O -parse-as-library -target arm64-apple-macosx15.
   -o "$app_bundle/Contents/MacOS/ipv6-route-helper"
 xcrun swiftc -swift-version 5 -O -parse-as-library -target arm64-apple-macosx15.0 \
   Sources/Models.swift Sources/IPv6.swift Sources/SSHImporter.swift \
-  Sources/SocketClient.swift Sources/CommandRunner.swift Sources/WeChatDiscovery.swift Sources/AppModel.swift Sources/Views.swift Sources/AppEntry.swift \
-  -framework AppKit -framework SwiftUI \
+  Sources/SocketClient.swift Sources/CommandRunner.swift Sources/WeChatDiscovery.swift Sources/AppModel.swift \
+  Sources/NetbridgeSync.swift Sources/SSHSyncModel.swift Sources/SSHSyncViews.swift Sources/Views.swift Sources/AppEntry.swift \
+  -framework AppKit -framework SwiftUI -framework Security \
   -o "$app_bundle/Contents/MacOS/IPv6Whitelist"
 cp initial-whitelist.json "$app_bundle/Contents/Resources/initial-whitelist.json"
 if [[ -f AppIcon.icns ]]; then cp AppIcon.icns "$app_bundle/Contents/Resources/AppIcon.icns"; fi
@@ -24,12 +25,12 @@ cat > "$app_bundle/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>local.timo.IPv6Whitelist</string>
 <key>CFBundleExecutable</key><string>IPv6Whitelist</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.1.1</string>
-<key>CFBundleVersion</key><string>3</string>
+<key>CFBundleShortVersionString</key><string>1.2.0</string>
+<key>CFBundleVersion</key><string>4</string>
 <key>LSMinimumSystemVersion</key><string>15.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>CFBundleIconFile</key><string>AppIcon</string>
-<key>NSHumanReadableCopyright</key><string>Local utility. No analytics or external service.</string>
+<key>NSHumanReadableCopyright</key><string>Local utility. No analytics.</string>
 </dict></plist>
 PLIST
 /usr/bin/codesign --force --sign - "$app_bundle/Contents/MacOS/ipv6-route-helper"

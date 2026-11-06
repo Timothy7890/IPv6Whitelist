@@ -1,15 +1,22 @@
 import SwiftUI
 import AppKit
 
-private enum UITheme {
+enum UITheme {
     static let accent = Color(red: 0.08, green: 0.59, blue: 0.49)
     static let line = Color.primary.opacity(0.08)
     static let muted = Color.secondary.opacity(0.07)
     static let panel = Color(nsColor: .controlBackgroundColor)
 }
 
+private enum Workspace {
+    case whitelist
+    case sshConfig
+}
+
 struct MainView: View {
     @ObservedObject var model: AppModel
+    @ObservedObject var sshSync: SSHSyncModel
+    @State private var workspace = Workspace.whitelist
     @State private var search = ""
     @State private var selectedID: UUID?
     @State private var editingEntry: WhitelistEntry?
@@ -31,7 +38,10 @@ struct MainView: View {
         HStack(spacing: 0) {
             sidebar
             Rectangle().fill(UITheme.line).frame(width: 1)
-            mainContent
+            switch workspace {
+            case .whitelist: mainContent
+            case .sshConfig: SSHSyncView(sync: sshSync)
+            }
         }
         .frame(minWidth: 990, minHeight: 760)
         .background(Color(nsColor: .windowBackgroundColor))
@@ -85,15 +95,8 @@ struct MainView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text("工作空间").font(.system(size: 10, weight: .semibold)).foregroundStyle(.tertiary)
                     .padding(.horizontal, 10)
-                HStack(spacing: 10) {
-                    Image(systemName: "checklist").font(.system(size: 15))
-                    Text("IPv6 白名单").font(.system(size: 13, weight: .semibold))
-                    Spacer()
-                    Text("\(model.entries.count)").font(.system(size: 11, weight: .medium, design: .rounded))
-                }
-                .foregroundStyle(UITheme.accent)
-                .padding(.horizontal, 12).padding(.vertical, 11)
-                .background(UITheme.accent.opacity(0.10), in: RoundedRectangle(cornerRadius: 9))
+                workspaceButton(.whitelist, title: "IPv6 白名单", systemImage: "checklist", count: model.entries.count)
+                workspaceButton(.sshConfig, title: "SSH Config 更新", systemImage: "terminal", count: sshSync.settings.mappings.count)
                 Button { showLogs = true } label: {
                     Label("运行记录", systemImage: "clock.arrow.circlepath")
                         .font(.system(size: 13)).frame(maxWidth: .infinity, alignment: .leading)
@@ -143,6 +146,23 @@ struct MainView: View {
         .frame(width: 214)
         .frame(maxHeight: .infinity)
         .background(.ultraThinMaterial)
+    }
+
+    private func workspaceButton(_ target: Workspace, title: String, systemImage: String, count: Int) -> some View {
+        let selected = workspace == target
+        return Button { workspace = target } label: {
+            HStack(spacing: 10) {
+                Image(systemName: systemImage).font(.system(size: 15))
+                Text(title).font(.system(size: 13, weight: selected ? .semibold : .regular)).lineLimit(1)
+                Spacer()
+                Text("\(count)").font(.system(size: 11, weight: .medium, design: .rounded))
+            }
+            .foregroundStyle(selected ? UITheme.accent : Color.secondary)
+            .padding(.horizontal, 12).padding(.vertical, 11)
+            .background(selected ? UITheme.accent.opacity(0.10) : Color.clear, in: RoundedRectangle(cornerRadius: 9))
+            .contentShape(RoundedRectangle(cornerRadius: 9))
+        }
+        .buttonStyle(.plain)
     }
 
     private var mainContent: some View {
@@ -487,6 +507,7 @@ struct MainView: View {
             helpItem("lock.shield", "白名单地址会看到你的真实出口", "白名单通过 Wi-Fi 直接连接，目标服务器可以看到该网络的公网 IPv6。移除默认直连路由不会自动启用代理；Shadowrocket 未配置好时，白名单外 IPv6 可能不可用。")
             helpItem("doc.on.doc", "系统 HTTP 代理需要额外规则", "使用系统 HTTP/HTTPS 代理的应用会先将请求交给 Shadowrocket，单靠主机路由不能强制这些请求直连。点击“复制 Shadowrocket 直连规则”，将 DIRECT 规则加入其配置，并放在其他可能先匹配的规则之前。")
             helpItem("arrow.down.doc", "SSH 导入可以重复执行", "导入 SSH 配置中的 IPv6 字面地址。重复地址会合并；域名不自动解析。导入仅更新本应用的白名单，不修改 SSH 配置。")
+            helpItem("terminal", "SSH Config 更新（默认关闭）", "只有设置令牌并启用后才会工作：只在你点击时读取 netbridge Controller，令牌保存在钥匙串。启用时备份 ~/.ssh/config 并在顶部加一行 Include，之后只改 ~/.ssh/config.d/netbridge-dynamic。不读取密钥，也不发起 SSH 连接。")
             helpItem("power", "关闭窗口后仍可在菜单栏管理", "停止管理或退出应用时会清理本应用创建的路由。当前为手动启动，没有启用登录自启。")
             helpItem("person.badge.key", "为什么需要管理员授权", "修改系统路由需要管理员权限。管理服务未运行时，开启管理会通过 macOS 授权安装并启动服务；退出应用后服务也会停止。白名单保存在你的电脑上。")
                 }

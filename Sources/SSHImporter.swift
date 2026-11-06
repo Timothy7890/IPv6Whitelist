@@ -1,6 +1,17 @@
 import Foundation
 import Darwin
 
+struct SSHEffectiveHost: Identifiable, Equatable {
+    var alias: String
+    var hostName: String
+    var port: Int?
+    var id: String { alias }
+    var display: String {
+        guard let port else { return hostName }
+        return hostName.contains(":") ? "[\(hostName)]:\(port)" : "\(hostName):\(port)"
+    }
+}
+
 struct SSHImportResult {
     var entries: [WhitelistEntry]
     var warnings: [String]
@@ -38,6 +49,17 @@ enum SSHImporter {
         }, warnings: reader.warnings)
     }
 
+    /// Every concrete Host alias with the values ssh would use for it.
+    static func effectiveHosts(configPath: String = NSHomeDirectory() + "/.ssh/config") -> [SSHEffectiveHost] {
+        let reader = Reader()
+        let nodes = reader.read(NSString(string: configPath).expandingTildeInPath, stack: [])
+        return reader.aliases.sorted { $0.localizedStandardCompare($1) == .orderedAscending }.map { alias in
+            var state = Evaluation(alias: alias)
+            reader.evaluate(nodes, state: &state)
+            return SSHEffectiveHost(alias: alias, hostName: state.hostname ?? alias, port: state.port)
+        }
+    }
+
     private indirect enum Node {
         case directive(String, [String], String)
         case include([Node])
@@ -48,6 +70,7 @@ enum SSHImporter {
         var active = true
         var hostname: String?
         var hostnameSource: String?
+        var port: Int?
     }
 
     private final class Reader {
@@ -120,7 +143,7 @@ enum SSHImporter {
                             if aliasSources[alias] == nil { aliasSources[alias] = location }
                         }
                         nodes.append(.directive(keyword, arguments, location))
-                    case "hostname", "match":
+                    case "hostname", "match", "port":
                         nodes.append(.directive(keyword, arguments, location))
                     default:
                         break
@@ -137,7 +160,11 @@ enum SSHImporter {
             for node in nodes {
                 switch node {
                 case .include(let children):
-                    if state.active { evaluate(children, state: &state) }
+                    if state.active {
+                        // Host lines in an included file do not apply after it ends.
+                        evaluate(children, state: &state)
+                        state.active = true
+                    }
                 case .directive(let keyword, let args, let source):
                     switch keyword {
                     case "host": state.active = matches(args, value: state.alias)
@@ -146,6 +173,8 @@ enum SSHImporter {
                             state.hostname = first.replacingOccurrences(of: "%h", with: state.alias)
                             state.hostnameSource = source
                         }
+                    case "port":
+                        if state.active, state.port == nil, let first = args.first { state.port = Int(first) }
                     case "match":
                         state.active = matchCondition(args, state: state, source: source)
                     default: break

@@ -43,7 +43,7 @@
 
 辅助程序通过 root 所有的运行目录和受限 UNIX socket 通信，校验连接用户；只接受固定操作及经过校验的单个 IPv6 地址，不接受任意 shell 命令、路径或其他网卡。客户端也核对服务端为 root。辅助程序退出后可执行文件保留，但不会自动运行。
 
-SSH 导入只读取 `~/.ssh/config` 及其 `Include` 配置，不读取 `IdentityFile` 指向的密钥或密码，不修改 SSH 文件，不运行 `ssh -G`、`Match exec` 或 `ProxyCommand`，也不发起网络连接。支持 Include/glob、Host 通配符与首值优先；不支持的 Match 条件会跳过并在运行记录中提示。应用无遥测或远程服务。
+SSH 导入只读取 `~/.ssh/config` 及其 `Include` 配置，不读取 `IdentityFile` 指向的密钥或密码，不修改 SSH 文件，不运行 `ssh -G`、`Match exec` 或 `ProxyCommand`，也不发起网络连接。支持 Include/glob、Host 通配符与首值优先；不支持的 Match 条件会跳过并在运行记录中提示。应用无遥测。除下面可选的“SSH Config 更新”外，不连接远程服务。
 
 ## 编译与验证
 
@@ -70,6 +70,32 @@ xcrun swiftc Sources/Models.swift Sources/IPv6.swift Sources/SSHImporter.swift \
 `integration-test.py` 是供维护者使用的管理员集成测试：会临时添加两条文档保留地址的 `/128` 路由，检查增删、普通选路、退出清理及默认路由保持不变，最终清理测试数据。它不发送外部网络数据；运行前需了解会实际修改测试路由，且当前 Wi-Fi 必须有 IPv6 网关。
 
 主要源码分工：`AppModel.swift` 管理状态与持久化；`HelperMain.swift` 管理权限边界和路由生命周期；`SocketClient.swift` 负责本地通信；`SSHImporter.swift` 与 `IPv6.swift` 负责配置导入和地址校验；`Views.swift`/`AppEntry.swift` 提供窗口与菜单栏。
+
+## 1.2.0：SSH Config 更新
+
+新工作空间“SSH Config 更新”根据 netbridge 上报的地址，一键更新指定 SSH Host 的 `HostName`。默认不工作，需要设置令牌并启用；只在打开页面、点击刷新或一键更新时读取 Controller，没有后台定时任务。
+
+1. 在 Controller 配置 `NETBRIDGE_CONTROLLER_READ_ONLY_TOKEN`，把令牌粘贴到 App，保存在 macOS 钥匙串。这个令牌只能调用 `GET /v1/tunnels`。
+2. 点击“启用”：先备份 `~/.ssh/config` 为同目录的 `config.netbridge-backup-时间`，再在最顶部加入 `Include ~/.ssh/config.d/netbridge-dynamic`。其余内容按字节保留；如果 Include 已存在但位置不对，只提示手动调整。
+3. 添加 Host：选择 B 端设备、SSH Host 和地址类型（局域网 IPv4、公网 IPv6 或 netbridge 公网入口）。一台设备可以对应多个 Host。
+4. 点击“一键更新”。之后 App 只写生成的 `~/.ssh/config.d/netbridge-dynamic`。
+
+SSH 对同一选项采用最先读到的值，所以生成的文件优先于主配置；主配置里其他选项（`User`、`ProxyJump`、密钥等）继续生效。移除映射后，该 Host 恢复使用主配置的值；删除 Include 那一行即可全部恢复。
+
+- 映射保存在 `ssh-config-sync.json`（0600）。设备离线或没有对应地址时保留上次的值，不会删除。
+- 设备按公钥 `key_id` 绑定，名称重复也不会串。
+- 生成的配置带 `HostKeyAlias netbridge-<Host>`，指纹按 Host 而不是 IP 记录：IP 变化不会要求重新信任，但主机密钥仍会校验；每个 Host 启用后第一次连接会询问一次。
+- 写入前校验 Host 名和地址，拒绝可能注入 SSH 选项的内容。令牌只发送到配置的 HTTPS 地址，并拒绝重定向。
+- App 不读取 SSH 密钥，也不发起 SSH 连接。重新编译后签名会变，读取钥匙串时 macOS 可能再次询问。
+- 公网 IPv6 变化后不会自动更新 IPv6 白名单，需要重新“导入 SSH”；旧地址要手动移除。
+
+开发验证：
+
+```bash
+xcrun swiftc -swift-version 5 Sources/Models.swift Sources/IPv6.swift Sources/SSHImporter.swift \
+  Sources/NetbridgeSync.swift SSHSyncTests/main.swift -o /tmp/ssh-sync-tests
+/tmp/ssh-sync-tests
+```
 
 ## 1.1.0：自动维护微信 IPv6
 
