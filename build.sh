@@ -25,8 +25,8 @@ cat > "$app_bundle/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>local.timo.IPv6Whitelist</string>
 <key>CFBundleExecutable</key><string>IPv6Whitelist</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.2.0</string>
-<key>CFBundleVersion</key><string>4</string>
+<key>CFBundleShortVersionString</key><string>1.2.1</string>
+<key>CFBundleVersion</key><string>5</string>
 <key>LSMinimumSystemVersion</key><string>15.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>CFBundleIconFile</key><string>AppIcon</string>

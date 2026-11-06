@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct SSHSyncView: View {
     @ObservedObject var sync: SSHSyncModel
@@ -278,7 +279,8 @@ struct SSHSyncView: View {
                             sync.setProxyJump(jump, for: mapping)
                             editingJump = nil
                         }
-                    )
+                    ),
+                    autoFocus: true
                 )
             }
             .padding(14).frame(width: 400)
@@ -328,14 +330,91 @@ struct SSHSyncView: View {
     }
 }
 
+/// A plain NSTextField because the arrow keys must reach the list while typing
+/// continues, and they must stay with the input method while it is composing:
+/// AppKit only sends these commands when no composition is using them.
+private struct SSHSearchTextField: NSViewRepresentable {
+    var placeholder: String
+    @Binding var text: String
+    var autoFocus: Bool
+    var onMove: ((Int) -> Void)?
+    var onReturn: (() -> Bool)?
+
+    final class Field: NSTextField {
+        var autoFocus = false
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard autoFocus, window != nil else { return }
+            autoFocus = false
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.window?.makeFirstResponder(self)
+            }
+        }
+    }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: SSHSearchTextField
+        init(_ parent: SSHSearchTextField) { self.parent = parent }
+
+        func controlTextDidChange(_ notification: Notification) {
+            guard let field = notification.object as? NSTextField else { return }
+            parent.text = field.stringValue
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+            switch selector {
+            case #selector(NSResponder.moveDown(_:)):
+                guard let onMove = parent.onMove else { return false }
+                onMove(1)
+                return true
+            case #selector(NSResponder.moveUp(_:)):
+                guard let onMove = parent.onMove else { return false }
+                onMove(-1)
+                return true
+            case #selector(NSResponder.insertNewline(_:)):
+                return parent.onReturn?() ?? false
+            default:
+                return false
+            }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> Field {
+        let field = Field()
+        field.autoFocus = autoFocus
+        field.isBordered = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.font = .systemFont(ofSize: 12)
+        field.placeholderString = placeholder
+        field.lineBreakMode = .byTruncatingTail
+        field.cell?.usesSingleLineMode = true
+        field.delegate = context.coordinator
+        return field
+    }
+
+    func updateNSView(_ field: Field, context: Context) {
+        context.coordinator.parent = self
+        let composing = (field.currentEditor() as? NSTextView)?.hasMarkedText() ?? false
+        if !composing, field.stringValue != text { field.stringValue = text }
+    }
+}
+
 private struct SSHSearchField: View {
     var placeholder: String
     @Binding var text: String
+    var autoFocus = false
+    var onMove: ((Int) -> Void)? = nil
+    var onReturn: (() -> Bool)? = nil
 
     var body: some View {
         HStack(spacing: 7) {
             Image(systemName: "magnifyingglass").font(.system(size: 11)).foregroundStyle(.secondary)
-            TextField(placeholder, text: $text).textFieldStyle(.plain).font(.system(size: 12))
+            SSHSearchTextField(placeholder: placeholder, text: $text, autoFocus: autoFocus,
+                               onMove: onMove, onReturn: onReturn)
             if !text.isEmpty {
                 Button { text = "" } label: { Image(systemName: "xmark.circle.fill") }
                     .buttonStyle(.plain).foregroundStyle(.tertiary).help("清除")
@@ -350,6 +429,7 @@ private struct SSHHostRow: View {
     var title: String
     var detail: String
     var selected: Bool
+    var highlighted = false
     var action: () -> Void
 
     var body: some View {
@@ -364,7 +444,7 @@ private struct SSHHostRow: View {
                     .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
             }
             .padding(.horizontal, 10).padding(.vertical, 7)
-            .background(selected ? UITheme.accent.opacity(0.10) : Color.clear)
+            .background(highlighted ? UITheme.accent.opacity(0.24) : selected ? UITheme.accent.opacity(0.10) : Color.clear)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -374,40 +454,87 @@ private struct SSHHostRow: View {
 /// Keep the main config's jump, connect directly, or pick a Host. Searching
 /// narrows the Hosts only, so the first two stay one click away.
 struct SSHJumpList: View {
+    // Control characters cannot appear in an alias, so these never collide with one.
+    private static let inheritRow = "\u{1}inherit"
+    private static let directRow = "\u{1}direct"
+
     var hosts: [SSHEffectiveHost]
     @Binding var selection: String?
     var listHeight: CGFloat = 230
+    var autoFocus = false
     @State private var search = ""
+    @State private var highlighted: String?
+
+    private var matches: [SSHEffectiveHost] { filterSSHHosts(hosts, query: search) }
+
+    /// While searching, the keys go straight to the results.
+    private var keyboardRows: [String] {
+        let aliases = matches.map(\.alias)
+        return search.isEmpty ? [Self.inheritRow, Self.directRow] + aliases : aliases
+    }
+
+    private func choose(_ row: String) {
+        switch row {
+        case Self.inheritRow: selection = nil
+        case Self.directRow: selection = sshProxyJumpNone
+        default: selection = row
+        }
+    }
+
+    private func pressReturn() -> Bool {
+        if let highlighted {
+            choose(highlighted)
+            return true
+        }
+        if search.isEmpty { return false }
+        // Choosing a jump writes the config, so only an unambiguous result is picked.
+        if matches.count == 1 { choose(matches[0].alias) }
+        return true
+    }
 
     var body: some View {
-        let matches = filterSSHHosts(hosts, query: search)
+        let matches = self.matches
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text("跳板（ProxyJump）").font(.system(size: 12, weight: .medium))
                 Text("\(matches.count) / \(hosts.count)").font(.system(size: 10)).foregroundStyle(.secondary)
+                Spacer()
+                Text("↑↓ 选择  ⏎ 确认").font(.system(size: 10)).foregroundStyle(.tertiary)
             }
-            SSHSearchField(placeholder: "搜索跳板 Host 或地址", text: $search)
+            SSHSearchField(placeholder: "搜索跳板 Host 或地址", text: $search, autoFocus: autoFocus,
+                           onMove: { highlighted = movedHighlight(current: highlighted, items: keyboardRows, delta: $0) },
+                           onReturn: pressReturn)
             VStack(spacing: 0) {
-                SSHHostRow(title: "沿用主配置", detail: "默认", selected: selection == nil) { selection = nil }
-                SSHHostRow(title: "直连", detail: "不走跳板", selected: selection == sshProxyJumpNone) { selection = sshProxyJumpNone }
+                SSHHostRow(title: "沿用主配置", detail: "默认", selected: selection == nil,
+                           highlighted: highlighted == Self.inheritRow) { selection = nil }
+                SSHHostRow(title: "直连", detail: "不走跳板", selected: selection == sshProxyJumpNone,
+                           highlighted: highlighted == Self.directRow) { selection = sshProxyJumpNone }
                 Rectangle().fill(UITheme.line).frame(height: 1)
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(matches) { host in
-                            SSHHostRow(title: host.alias, detail: host.display, selected: selection == host.alias) {
-                                selection = host.alias
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 0) {
+                            ForEach(matches) { host in
+                                SSHHostRow(title: host.alias, detail: host.display, selected: selection == host.alias,
+                                           highlighted: highlighted == host.alias) {
+                                    selection = host.alias
+                                }
+                                .id(host.alias)
+                            }
+                            if matches.isEmpty {
+                                Text("没有匹配的 Host").font(.system(size: 11)).foregroundStyle(.secondary).padding(18)
                             }
                         }
-                        if matches.isEmpty {
-                            Text("没有匹配的 Host").font(.system(size: 11)).foregroundStyle(.secondary).padding(18)
-                        }
+                    }
+                    .frame(height: listHeight)
+                    .onChange(of: highlighted) {
+                        if let highlighted, hosts.contains(where: { $0.alias == highlighted }) { proxy.scrollTo(highlighted) }
                     }
                 }
-                .frame(height: listHeight)
             }
             .background(UITheme.panel, in: RoundedRectangle(cornerRadius: 8))
             .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(UITheme.line))
         }
+        .onChange(of: search) { highlighted = nil }
     }
 }
 
@@ -420,6 +547,7 @@ struct SSHMappingEditor: View {
     @State private var forwardTarget = ""
     @State private var error: String?
     @State private var hostSearch = ""
+    @State private var highlightedHost: String?
     @State private var proxyJump: String?
 
     private var device: NetbridgeDevice? { sync.devices.first { $0.keyID == deviceID } }
@@ -485,6 +613,16 @@ struct SSHMappingEditor: View {
         .onChange(of: deviceID) { selectDefaultForward() }
     }
 
+    private func pressReturnInHosts(_ matches: [SSHEffectiveHost]) -> Bool {
+        if let highlightedHost {
+            alias = highlightedHost
+            return true
+        }
+        if hostSearch.isEmpty { return false }
+        if matches.count == 1 { alias = matches[0].alias }
+        return true
+    }
+
     private var hostPicker: some View {
         let matches = filterSSHHosts(aliases, query: hostSearch)
         return VStack(alignment: .leading, spacing: 8) {
@@ -497,23 +635,33 @@ struct SSHMappingEditor: View {
                         .foregroundStyle(UITheme.accent).lineLimit(1)
                 }
             }
-            SSHSearchField(placeholder: "搜索 Host 名称或地址，可用空格分隔多个词", text: $hostSearch)
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(matches) { host in
-                        SSHHostRow(title: host.alias, detail: host.display, selected: alias == host.alias) {
-                            alias = host.alias
+            SSHSearchField(placeholder: "搜索 Host 名称或地址，↑↓ 选择，⏎ 确认", text: $hostSearch, autoFocus: true,
+                           onMove: { highlightedHost = movedHighlight(current: highlightedHost, items: matches.map(\.alias), delta: $0) },
+                           onReturn: { pressReturnInHosts(matches) })
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(matches) { host in
+                            SSHHostRow(title: host.alias, detail: host.display, selected: alias == host.alias,
+                                       highlighted: highlightedHost == host.alias) {
+                                alias = host.alias
+                            }
+                            .id(host.alias)
+                        }
+                        if matches.isEmpty {
+                            Text("没有匹配的 Host").font(.system(size: 11)).foregroundStyle(.secondary).padding(24)
                         }
                     }
-                    if matches.isEmpty {
-                        Text("没有匹配的 Host").font(.system(size: 11)).foregroundStyle(.secondary).padding(24)
-                    }
+                }
+                .onChange(of: highlightedHost) {
+                    if let highlightedHost { proxy.scrollTo(highlightedHost) }
                 }
             }
             .frame(height: 150)
             .background(UITheme.panel, in: RoundedRectangle(cornerRadius: 8))
             .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(UITheme.line))
         }
+        .onChange(of: hostSearch) { highlightedHost = nil }
     }
 
     private func selectDefaultForward() {

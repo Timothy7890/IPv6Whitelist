@@ -461,3 +461,15 @@ func filterSSHMappings(_ mappings: [SSHMapping], query: String) -> [SSHMapping] 
         return words.allSatisfy { word in fields.contains { $0.localizedCaseInsensitiveContains(word) } }
     }
 }
+
+/// Moves a list highlight. Going up from the first item clears it, which hands
+/// the keyboard back to the search field; the last item stops at the end.
+func movedHighlight(current: String?, items: [String], delta: Int) -> String? {
+    guard !items.isEmpty else { return nil }
+    guard let current, let index = items.firstIndex(of: current) else {
+        return delta > 0 ? items[0] : nil
+    }
+    let next = index + delta
+    if next < 0 { return nil }
+    return items[min(next, items.count - 1)]
+}

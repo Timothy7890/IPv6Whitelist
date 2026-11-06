@@ -241,6 +241,17 @@ require(proxyJumpCreatesCycle(alias: "A", jump: "D", hosts: cycleHosts, mappings
 let oldMapping = try JSONDecoder().decode(SSHMapping.self, from: Data(#"{"id":"00000000-0000-0000-0000-000000000001","keyID":"k","deviceLabel":"d","hostAlias":"h","policy":"lanIPv4"}"#.utf8))
 require(oldMapping.proxyJump == nil, "old mapping decodes as inherit")
 
+// Keyboard highlight.
+let rows = ["a", "b", "c"]
+require(movedHighlight(current: nil, items: rows, delta: 1) == "a", "down enters the list")
+require(movedHighlight(current: nil, items: rows, delta: -1) == nil, "up stays in the search field")
+require(movedHighlight(current: "a", items: rows, delta: 1) == "b", "down moves")
+require(movedHighlight(current: "b", items: rows, delta: -1) == "a", "up moves")
+require(movedHighlight(current: "a", items: rows, delta: -1) == nil, "up from the first returns to the field")
+require(movedHighlight(current: "c", items: rows, delta: 1) == "c", "down stops at the end")
+require(movedHighlight(current: "gone", items: rows, delta: 1) == "a", "a row filtered away restarts at the top")
+require(movedHighlight(current: "a", items: [], delta: 1) == nil, "no rows")
+
 // Removing every mapping falls back to the main config.
 try writeDynamicSSHConfig(renderDynamicSSHConfig([]), paths: paths)
 require(try sshG(paths.config, host: "LXZ-606")["hostname"] == "192.0.2.1", "fallback after removal")
