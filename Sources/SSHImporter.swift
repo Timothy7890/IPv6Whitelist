@@ -5,6 +5,8 @@ struct SSHEffectiveHost: Identifiable, Equatable {
     var alias: String
     var hostName: String
     var port: Int?
+    var proxyJump: String? = nil
+    var usesProxyCommand = false
     var id: String { alias }
     var display: String {
         guard let port else { return hostName }
@@ -56,7 +58,8 @@ enum SSHImporter {
         return reader.aliases.sorted { $0.localizedStandardCompare($1) == .orderedAscending }.map { alias in
             var state = Evaluation(alias: alias)
             reader.evaluate(nodes, state: &state)
-            return SSHEffectiveHost(alias: alias, hostName: state.hostname ?? alias, port: state.port)
+            return SSHEffectiveHost(alias: alias, hostName: state.hostname ?? alias, port: state.port,
+                                    proxyJump: state.proxyJump, usesProxyCommand: state.usesProxyCommand)
         }
     }
 
@@ -71,6 +74,8 @@ enum SSHImporter {
         var hostname: String?
         var hostnameSource: String?
         var port: Int?
+        var proxyJump: String?
+        var usesProxyCommand = false
     }
 
     private final class Reader {
@@ -143,7 +148,7 @@ enum SSHImporter {
                             if aliasSources[alias] == nil { aliasSources[alias] = location }
                         }
                         nodes.append(.directive(keyword, arguments, location))
-                    case "hostname", "match", "port":
+                    case "hostname", "match", "port", "proxyjump", "proxycommand":
                         nodes.append(.directive(keyword, arguments, location))
                     default:
                         break
@@ -175,6 +180,11 @@ enum SSHImporter {
                         }
                     case "port":
                         if state.active, state.port == nil, let first = args.first { state.port = Int(first) }
+                    // ProxyJump and ProxyCommand compete: whichever comes first wins.
+                    case "proxyjump":
+                        if state.active, state.proxyJump == nil, !state.usesProxyCommand { state.proxyJump = args.first }
+                    case "proxycommand":
+                        if state.active, state.proxyJump == nil { state.usesProxyCommand = true }
                     case "match":
                         state.active = matchCondition(args, state: state, source: source)
                     default: break

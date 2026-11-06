@@ -118,6 +118,9 @@ struct SSHMapping: Codable, Equatable, Identifiable {
     var forwardTarget: String?
     /// What the generated file currently says, kept while the device is offline.
     var applied: SSHTarget?
+    /// nil keeps the main config's value, sshProxyJumpNone connects directly,
+    /// anything else is the Host to jump through.
+    var proxyJump: String?
 }
 
 func isIPLiteral(_ value: String) -> Bool {
@@ -141,6 +144,36 @@ func isSafeSSHAlias(_ value: String) -> Bool {
         .union(.controlCharacters)
         .union(CharacterSet(charactersIn: "*?!#\"'\\,%"))
     return value.unicodeScalars.allSatisfy { !forbidden.contains($0) }
+}
+
+let sshProxyJumpNone = "none"
+
+func isSafeSSHProxyJump(_ value: String) -> Bool {
+    value == sshProxyJumpNone || isSafeSSHAlias(value)
+}
+
+/// ProxyJump values can be comma-separated hops written as [user@]host[:port].
+private func proxyJumpHops(_ value: String) -> [String] {
+    value.split(separator: ",").map { hop in
+        var host = String(hop)
+        if let at = host.lastIndex(of: "@") { host = String(host[host.index(after: at)...]) }
+        if let colon = host.firstIndex(of: ":") { host = String(host[..<colon]) }
+        return host
+    }
+}
+
+/// Whether making `alias` jump through `jump` would lead back to `alias`. Mapped
+/// hosts use their chosen jump; the others use what the SSH config says.
+func proxyJumpCreatesCycle(alias: String, jump: String, hosts: [SSHEffectiveHost], mappings: [SSHMapping]) -> Bool {
+    var visited = Set<String>()
+    var pending = proxyJumpHops(jump)
+    while let hop = pending.popLast() {
+        if hop == alias { return true }
+        guard hop != sshProxyJumpNone, visited.insert(hop).inserted else { continue }
+        let next = mappings.first { $0.hostAlias == hop }?.proxyJump ?? hosts.first { $0.alias == hop }?.proxyJump
+        if let next { pending += proxyJumpHops(next) }
+    }
+    return false
 }
 
 func parseNetbridgeEntry(_ address: String) -> SSHTarget? {
@@ -174,13 +207,18 @@ func resolveSSHTarget(_ mapping: SSHMapping, device: NetbridgeDevice) -> SSHTarg
 /// change does not ask to trust the machine again. The key itself is still checked.
 func renderDynamicSSHConfig(_ mappings: [SSHMapping]) -> String {
     var lines = ["# 由 IPv6 白名单 App 生成，请勿手动修改；修改会在下次更新时被覆盖。"]
-    let applied = mappings.filter { isSafeSSHAlias($0.hostAlias) && $0.applied != nil }
+    let sorted = mappings.filter { isSafeSSHAlias($0.hostAlias) }
         .sorted { $0.hostAlias.localizedStandardCompare($1.hostAlias) == .orderedAscending }
-    for mapping in applied {
-        guard let target = mapping.applied, isSafeSSHHostName(target.hostName) else { continue }
-        lines += ["", "Host \(mapping.hostAlias)", "    HostName \(target.hostName)"]
-        if let port = target.port, (1...65535).contains(port) { lines.append("    Port \(port)") }
-        lines.append("    HostKeyAlias netbridge-\(mapping.hostAlias)")
+    for mapping in sorted {
+        var options: [String] = []
+        let target = mapping.applied.flatMap { isSafeSSHHostName($0.hostName) ? $0 : nil }
+        if let target {
+            options.append("    HostName \(target.hostName)")
+            if let port = target.port, (1...65535).contains(port) { options.append("    Port \(port)") }
+            options.append("    HostKeyAlias netbridge-\(mapping.hostAlias)")
+        }
+        if let jump = mapping.proxyJump, isSafeSSHProxyJump(jump) { options.append("    ProxyJump \(jump)") }
+        if !options.isEmpty { lines += ["", "Host \(mapping.hostAlias)"] + options }
     }
     return lines.joined(separator: "\n") + "\n"
 }
@@ -329,17 +367,67 @@ func netbridgeTunnelsURL(controller: String) throws -> URL {
     return url
 }
 
-func fetchNetbridgeTunnels(controller: String, token: String) async throws -> [NetbridgeTunnel] {
+struct SOCKSProxy: Equatable {
+    var host: String
+    var port: Int
+}
+
+/// Accepts host:port or a bare port on this Mac. Empty means connect directly.
+func parseSOCKSProxy(_ value: String) throws -> SOCKSProxy? {
+    var text = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    if text.isEmpty { return nil }
+    if text.lowercased().hasPrefix("socks5://") { text.removeFirst("socks5://".count) }
+    if Int(text) != nil { text = "127.0.0.1:" + text }
+    guard let target = parseNetbridgeEntry(text) else {
+        throw SSHSyncError.message("SOCKS5 代理地址格式不对，应为 127.0.0.1:1085。")
+    }
+    return SOCKSProxy(host: target.hostName, port: target.port ?? 0)
+}
+
+struct SOCKSProxyPreset: Identifiable, Equatable {
+    var name: String
+    var port: Int
+    var id: Int { port }
+    var address: String { "127.0.0.1:\(port)" }
+}
+
+/// Local SOCKS5 forwards on this Mac. Add new ones here.
+let socksProxyPresets = [
+    SOCKSProxyPreset(name: "3090C-613", port: 1083),
+    SOCKSProxyPreset(name: "5070-2048", port: 1092),
+    SOCKSProxyPreset(name: "LXZ-606", port: 1081),
+    SOCKSProxyPreset(name: "PYX-606", port: 1085),
+    SOCKSProxyPreset(name: "macmini-618", port: 1084),
+    SOCKSProxyPreset(name: "mybox-abyss", port: 1091),
+]
+
+func socksProxyPreset(matching value: String) -> SOCKSProxyPreset? {
+    guard let proxy = try? parseSOCKSProxy(value),
+          ["127.0.0.1", "localhost"].contains(proxy.host) else { return nil }
+    return socksProxyPresets.first { $0.port == proxy.port }
+}
+
+func fetchNetbridgeTunnels(controller: String, token: String, socksProxy: String = "") async throws -> [NetbridgeTunnel] {
     var request = URLRequest(url: try netbridgeTunnelsURL(controller: controller), timeoutInterval: 15)
     request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-    let session = URLSession(configuration: .ephemeral, delegate: RefuseRedirects(), delegateQueue: nil)
+    let configuration = URLSessionConfiguration.ephemeral
+    let proxy = try parseSOCKSProxy(socksProxy)
+    if let proxy {
+        configuration.connectionProxyDictionary = [
+            kCFNetworkProxiesSOCKSEnable as String: 1,
+            kCFNetworkProxiesSOCKSProxy as String: proxy.host,
+            kCFNetworkProxiesSOCKSPort as String: proxy.port,
+        ]
+    }
+    let session = URLSession(configuration: configuration, delegate: RefuseRedirects(), delegateQueue: nil)
     defer { session.finishTasksAndInvalidate() }
     let data: Data
     let response: URLResponse
     do {
         (data, response) = try await session.data(for: request)
     } catch {
-        throw SSHSyncError.message("无法连接 Controller：\(error.localizedDescription)")
+        let route = proxy.map { "（经 SOCKS5 \($0.host):\($0.port)）" } ?? ""
+        throw SSHSyncError.message("无法连接 Controller\(route)：\(error.localizedDescription)")
     }
     guard let http = response as? HTTPURLResponse else { throw SSHSyncError.message("Controller 返回了无效响应。") }
     switch http.statusCode {
@@ -351,5 +439,25 @@ func fetchNetbridgeTunnels(controller: String, token: String) async throws -> [N
         return try JSONDecoder().decode([NetbridgeTunnel].self, from: data)
     } catch {
         throw SSHSyncError.message("无法解析 Controller 的返回内容。")
+    }
+}
+
+// MARK: - Filtering
+
+/// Every space-separated word must match the alias or the address, in any order.
+func filterSSHHosts(_ hosts: [SSHEffectiveHost], query: String) -> [SSHEffectiveHost] {
+    let words = query.split(whereSeparator: \.isWhitespace).map(String.init)
+    guard !words.isEmpty else { return hosts }
+    return hosts.filter { host in
+        words.allSatisfy { host.alias.localizedCaseInsensitiveContains($0) || host.display.localizedCaseInsensitiveContains($0) }
+    }
+}
+
+func filterSSHMappings(_ mappings: [SSHMapping], query: String) -> [SSHMapping] {
+    let words = query.split(whereSeparator: \.isWhitespace).map(String.init)
+    guard !words.isEmpty else { return mappings }
+    return mappings.filter { mapping in
+        let fields = [mapping.hostAlias, mapping.deviceLabel, mapping.policy.title, mapping.applied?.display ?? ""]
+        return words.allSatisfy { word in fields.contains { $0.localizedCaseInsensitiveContains(word) } }
     }
 }

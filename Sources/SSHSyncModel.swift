@@ -46,6 +46,7 @@ struct KeychainTokenStore: SSHSyncTokenStore {
 
 struct SSHSyncSettings: Codable, Equatable {
     var controllerURL = "https://nbg.xingxingdiandian.xyz"
+    var socksProxy: String?
     var mappings: [SSHMapping] = []
 }
 
@@ -118,8 +119,10 @@ final class SSHSyncModel: ObservableObject {
         hosts = SSHImporter.effectiveHosts(configPath: paths.config.path)
     }
 
-    func setController(_ value: String) {
-        settings.controllerURL = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    func setConnection(controller: String, socksProxy: String) {
+        settings.controllerURL = controller.trimmingCharacters(in: .whitespacesAndNewlines)
+        let proxy = socksProxy.trimmingCharacters(in: .whitespacesAndNewlines)
+        settings.socksProxy = proxy.isEmpty ? nil : proxy
         saveSettings()
     }
 
@@ -178,7 +181,9 @@ final class SSHSyncModel: ObservableObject {
         }
         hasToken = true
         do {
-            devices = groupNetbridgeDevices(try await fetchNetbridgeTunnels(controller: settings.controllerURL, token: token))
+            devices = groupNetbridgeDevices(try await fetchNetbridgeTunnels(
+                controller: settings.controllerURL, token: token, socksProxy: settings.socksProxy ?? "")
+            )
             lastFetched = Date()
             errorText = nil
             return true
@@ -189,16 +194,58 @@ final class SSHSyncModel: ObservableObject {
         }
     }
 
-    func addMapping(device: NetbridgeDevice, alias: String, policy: SSHAddressPolicy, forwardTarget: String?) -> String? {
+    func proxyJumpError(alias: String, jump: String?) -> String? {
+        guard let jump else { return nil }
+        guard isSafeSSHProxyJump(jump) else { return "这个跳板名称不能使用。" }
+        if proxyJumpCreatesCycle(alias: alias, jump: jump, hosts: hosts, mappings: settings.mappings) {
+            return "\(jump) 最终又会跳回 \(alias)，会形成循环，SSH 无法连接。"
+        }
+        return nil
+    }
+
+    /// Takes effect right away: unlike addresses, it needs nothing from the Controller.
+    func setProxyJump(_ jump: String?, for mapping: SSHMapping) {
+        if let problem = proxyJumpError(alias: mapping.hostAlias, jump: jump) {
+            errorText = problem
+            return
+        }
+        var updated = settings.mappings
+        guard let index = updated.firstIndex(where: { $0.id == mapping.id }) else { return }
+        updated[index].proxyJump = jump
+        do {
+            try writeDynamicSSHConfig(renderDynamicSSHConfig(updated), paths: paths)
+        } catch {
+            errorText = "写入 SSH 配置失败：\(error.localizedDescription)"
+            return
+        }
+        settings.mappings = updated
+        saveSettings()
+        reloadLocalState()
+        errorText = nil
+        log("\(mapping.hostAlias) 的跳板改为：\(jump == nil ? "沿用主配置" : jump == sshProxyJumpNone ? "直连" : jump!)")
+    }
+
+    func addMapping(device: NetbridgeDevice, alias: String, policy: SSHAddressPolicy, forwardTarget: String?, proxyJump: String? = nil) -> String? {
         guard isSafeSSHAlias(alias) else { return "这个 Host 名称不能用于自动更新。" }
         guard !mappedAliases.contains(alias) else { return "这个 Host 已经配置过了。" }
         if policy == .tunnelEntry, forwardTarget == nil { return "请选择要使用的转发目标。" }
-        settings.mappings.append(SSHMapping(
+        if let problem = proxyJumpError(alias: alias, jump: proxyJump) { return problem }
+        var updated = settings.mappings
+        updated.append(SSHMapping(
             keyID: device.keyID, deviceLabel: device.label, hostAlias: alias, policy: policy,
-            forwardTarget: policy == .tunnelEntry ? forwardTarget : nil
+            forwardTarget: policy == .tunnelEntry ? forwardTarget : nil, proxyJump: proxyJump
         ))
-        settings.mappings.sort { $0.hostAlias.localizedStandardCompare($1.hostAlias) == .orderedAscending }
+        updated.sort { $0.hostAlias.localizedStandardCompare($1.hostAlias) == .orderedAscending }
+        if proxyJump != nil {
+            do {
+                try writeDynamicSSHConfig(renderDynamicSSHConfig(updated), paths: paths)
+            } catch {
+                return "写入 SSH 配置失败：\(error.localizedDescription)"
+            }
+        }
+        settings.mappings = updated
         saveSettings()
+        reloadLocalState()
         log("新增 SSH 动态更新：\(device.label) → \(alias)（\(policy.title)）")
         return nil
     }

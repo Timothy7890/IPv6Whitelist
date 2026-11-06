@@ -86,6 +86,46 @@ for bad in ["http://nbg.example.com", "nbg.example.com", "", "ftp://a"] {
     require((try? netbridgeTunnelsURL(controller: bad)) == nil, "URL accepted: \(bad)")
 }
 
+// SOCKS5 proxy settings.
+require(try parseSOCKSProxy("") == nil, "empty proxy means direct")
+require(try parseSOCKSProxy(" 127.0.0.1:1085 ") == SOCKSProxy(host: "127.0.0.1", port: 1085), "host and port")
+require(try parseSOCKSProxy("1085") == SOCKSProxy(host: "127.0.0.1", port: 1085), "bare port")
+require(try parseSOCKSProxy("socks5://localhost:1085") == SOCKSProxy(host: "localhost", port: 1085), "scheme")
+for bad in ["127.0.0.1", "127.0.0.1:99999", "a b:1085", "70000"] {
+    require((try? parseSOCKSProxy(bad)) == nil, "proxy accepted: \(bad)")
+}
+
+require(socksProxyPresets.count == Set(socksProxyPresets.map(\.port)).count, "preset ports are unique")
+require(socksProxyPreset(matching: "127.0.0.1:1085")?.name == "PYX-606", "preset by address")
+require(socksProxyPreset(matching: "1091")?.name == "mybox-abyss", "preset by bare port")
+require(socksProxyPreset(matching: "localhost:1081")?.name == "LXZ-606", "preset by localhost")
+require(socksProxyPreset(matching: "192.0.2.1:1085") == nil, "another machine is not a preset")
+require(socksProxyPreset(matching: "") == nil, "direct is not a preset")
+for preset in socksProxyPresets {
+    require(try parseSOCKSProxy(preset.address) == SOCKSProxy(host: "127.0.0.1", port: preset.port), "preset parses")
+}
+
+// Filtering.
+let filterHosts = [
+    SSHEffectiveHost(alias: "LXZ-606", hostName: "10.195.66.203"),
+    SSHEffectiveHost(alias: "WIN-5070-ipv6", hostName: "240e:390:705c:3000::539"),
+    SSHEffectiveHost(alias: "WIN-5070-frp", hostName: "8.136.105.252", port: 20091),
+]
+func aliases(_ query: String) -> [String] { filterSSHHosts(filterHosts, query: query).map(\.alias) }
+require(aliases("").count == 3 && aliases("   ").count == 3, "empty query keeps all")
+require(aliases("lxz") == ["LXZ-606"], "case-insensitive alias")
+require(aliases("10.195") == ["LXZ-606"], "by address")
+require(aliases("20091") == ["WIN-5070-frp"], "by port")
+require(aliases("ipv6 win") == ["WIN-5070-ipv6"], "all words in any order")
+require(aliases("lxz ipv6").isEmpty, "every word must match")
+let filterMappings = [
+    SSHMapping(keyID: "k", deviceLabel: "NAS", hostAlias: "home", policy: .publicIPv6),
+    SSHMapping(keyID: "k", deviceLabel: "WIN", hostAlias: "work", policy: .lanIPv4, applied: SSHTarget(hostName: "10.0.0.1")),
+]
+require(filterSSHMappings(filterMappings, query: "nas").map(\.hostAlias) == ["home"], "mapping by device")
+require(filterSSHMappings(filterMappings, query: "10.0").map(\.hostAlias) == ["work"], "mapping by address")
+require(filterSSHMappings(filterMappings, query: "").count == 2, "mapping empty query")
+
 // Files, checked against the real ssh parser.
 let directory = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("ssh-sync-tests-\(UUID().uuidString)")
 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -142,6 +182,65 @@ require(effective["LXZ-606"]?.hostName == "10.195.66.203", "effective HostName")
 require(effective["WIN"]?.display == "8.136.105.252:20091", "effective port")
 require(effective["clawd"]?.display == "192.0.2.9:2222", "hosts after the include are still evaluated")
 
+// ProxyJump: inherit, direct, or a chosen Host. Checked with the real ssh.
+var jumpMapping = mapping(lxz, "LXZ-606", .lanIPv4)
+jumpMapping.applied = SSHTarget(hostName: "10.195.66.203")
+try writeDynamicSSHConfig(renderDynamicSSHConfig([jumpMapping]), paths: paths)
+require(try sshG(paths.config, host: "LXZ-606")["proxyjump"] == "clawd", "inherit keeps the main config's jump")
+jumpMapping.proxyJump = sshProxyJumpNone
+try writeDynamicSSHConfig(renderDynamicSSHConfig([jumpMapping]), paths: paths)
+require(try sshG(paths.config, host: "LXZ-606")["proxyjump"] == nil, "direct overrides the main config's jump")
+require(try sshG(paths.config, host: "LXZ-606")["hostname"] == "10.195.66.203", "direct keeps the address")
+jumpMapping.proxyJump = "WIN"
+try writeDynamicSSHConfig(renderDynamicSSHConfig([jumpMapping]), paths: paths)
+require(try sshG(paths.config, host: "LXZ-606")["proxyjump"] == "WIN", "chosen jump overrides the main config's")
+require(try sshG(paths.config, host: "LXZ-606")["user"] == "huawei", "other options still apply")
+require(SSHImporter.effectiveHosts(configPath: paths.config.path).first { $0.alias == "LXZ-606" }?.proxyJump == "WIN", "parser agrees with ssh")
+
+// A jump can be set before any address is known, and keeps the main HostName.
+var jumpOnly = mapping(win, "WIN", .publicIPv6)
+jumpOnly.proxyJump = "clawd"
+try writeDynamicSSHConfig(renderDynamicSSHConfig([jumpOnly]), paths: paths)
+let jumpOnlyConfig = try sshG(paths.config, host: "WIN")
+require(jumpOnlyConfig["proxyjump"] == "clawd" && jumpOnlyConfig["hostname"] == "192.0.2.2" && jumpOnlyConfig["hostkeyalias"] == nil, "jump without address")
+
+// It also wins over a ProxyCommand later in the main config.
+let commandConfig = directory.appendingPathComponent("command-config")
+try Data("\(paths.includeLine)\nHost WIN\n  ProxyCommand nc %h %p\n".utf8).write(to: commandConfig)
+var overCommand = mapping(win, "WIN", .publicIPv6)
+overCommand.proxyJump = sshProxyJumpNone
+try writeDynamicSSHConfig(renderDynamicSSHConfig([overCommand]), paths: paths)
+require(try sshG(commandConfig, host: "WIN")["proxycommand"] == nil, "direct wins over ProxyCommand")
+try writeDynamicSSHConfig(renderDynamicSSHConfig([]), paths: paths)
+require(SSHImporter.effectiveHosts(configPath: commandConfig.path).first { $0.alias == "WIN" }?.usesProxyCommand == true, "ProxyCommand detected")
+
+// Unsafe jump values are never written.
+var badJump = mapping(lxz, "LXZ-606", .lanIPv4)
+badJump.proxyJump = "a\nProxyCommand x"
+require(!renderDynamicSSHConfig([badJump]).contains("ProxyCommand"), "jump injection")
+require(!isSafeSSHProxyJump("a,b") && !isSafeSSHProxyJump("-oX") && isSafeSSHProxyJump("none") && isSafeSSHProxyJump("PYX-606"), "jump validation")
+
+// Cycles are refused.
+let cycleHosts = [
+    SSHEffectiveHost(alias: "A", hostName: "192.0.2.1"),
+    SSHEffectiveHost(alias: "B", hostName: "192.0.2.2", proxyJump: "A"),
+    SSHEffectiveHost(alias: "C", hostName: "192.0.2.3", proxyJump: "user@B:22,D"),
+    SSHEffectiveHost(alias: "D", hostName: "192.0.2.4"),
+]
+require(proxyJumpCreatesCycle(alias: "A", jump: "A", hosts: cycleHosts, mappings: []), "self jump")
+require(proxyJumpCreatesCycle(alias: "A", jump: "B", hosts: cycleHosts, mappings: []), "two hosts")
+require(proxyJumpCreatesCycle(alias: "A", jump: "C", hosts: cycleHosts, mappings: []), "through user@host:port hops")
+require(!proxyJumpCreatesCycle(alias: "A", jump: "D", hosts: cycleHosts, mappings: []), "no cycle")
+require(!proxyJumpCreatesCycle(alias: "A", jump: "none", hosts: cycleHosts, mappings: []), "direct is never a cycle")
+var freed = mapping(lxz, "B", .lanIPv4); freed.proxyJump = sshProxyJumpNone
+require(!proxyJumpCreatesCycle(alias: "A", jump: "B", hosts: cycleHosts, mappings: [freed]), "a mapping's choice replaces the config's")
+var looped = mapping(lxz, "D", .lanIPv4); looped.proxyJump = "A"
+require(proxyJumpCreatesCycle(alias: "A", jump: "D", hosts: cycleHosts, mappings: [looped]), "a mapping can create the cycle")
+
+// Settings saved by the previous version still load.
+let oldMapping = try JSONDecoder().decode(SSHMapping.self, from: Data(#"{"id":"00000000-0000-0000-0000-000000000001","keyID":"k","deviceLabel":"d","hostAlias":"h","policy":"lanIPv4"}"#.utf8))
+require(oldMapping.proxyJump == nil, "old mapping decodes as inherit")
+
 // Removing every mapping falls back to the main config.
 try writeDynamicSSHConfig(renderDynamicSSHConfig([]), paths: paths)
 require(try sshG(paths.config, host: "LXZ-606")["hostname"] == "192.0.2.1", "fallback after removal")
@@ -175,11 +274,18 @@ require((try String(contentsOf: target, encoding: .utf8)).contains(paths.include
 
 // Live read against the real Controller: token comes from the environment.
 if let token = ProcessInfo.processInfo.environment["NETBRIDGE_LIVE_TOKEN"] {
-    let live = groupNetbridgeDevices(try await fetchNetbridgeTunnels(controller: "https://nbg.xingxingdiandian.xyz", token: token))
+    let socks = ProcessInfo.processInfo.environment["NETBRIDGE_LIVE_SOCKS"] ?? ""
+    print("route:", socks.isEmpty ? "direct" : socks)
+    let live = groupNetbridgeDevices(try await fetchNetbridgeTunnels(controller: "https://nbg.xingxingdiandian.xyz", token: token, socksProxy: socks))
     for device in live {
         print(device.label, device.addresses.filter(\.primary).map(\.ip), device.forwards.map(\.publicAddress))
     }
-    let denied = try? await fetchNetbridgeTunnels(controller: "https://nbg.xingxingdiandian.xyz", token: "wrong-token-wrong-token")
+    let denied = try? await fetchNetbridgeTunnels(controller: "https://nbg.xingxingdiandian.xyz", token: "wrong-token-wrong-token", socksProxy: socks)
     require(denied == nil, "wrong token refused")
+    if !socks.isEmpty {
+        // A dead proxy must fail, which proves requests really go through the setting.
+        let dead = try? await fetchNetbridgeTunnels(controller: "https://nbg.xingxingdiandian.xyz", token: token, socksProxy: "127.0.0.1:9")
+        require(dead == nil, "dead proxy was bypassed")
+    }
 }
 print("SSH sync tests passed")

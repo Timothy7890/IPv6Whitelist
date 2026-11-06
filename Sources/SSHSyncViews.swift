@@ -6,7 +6,10 @@ struct SSHSyncView: View {
     @State private var showToken = false
     @State private var confirmInclude = false
     @State private var controllerText = ""
+    @State private var proxyText = ""
     @State private var pendingRemove: SSHMapping?
+    @State private var mappingSearch = ""
+    @State private var editingJump: UUID?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -28,6 +31,7 @@ struct SSHSyncView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .onAppear {
             controllerText = sync.settings.controllerURL
+            proxyText = sync.settings.socksProxy ?? ""
             sync.reloadLocalState()
             if sync.hasToken, sync.lastFetched == nil { Task { await sync.refresh() } }
         }
@@ -64,7 +68,7 @@ struct SSHSyncView: View {
             Button { showAdd = true } label: { Label("添加 Host", systemImage: "plus") }
                 .controlSize(.large).disabled(sync.devices.isEmpty)
             Button {
-                sync.setController(controllerText)
+                saveConnection()
                 Task { await sync.updateAll() }
             } label: {
                 Label(sync.pendingCount > 0 ? "一键更新（\(sync.pendingCount)）" : "一键更新",
@@ -86,14 +90,27 @@ struct SSHSyncView: View {
             }
             TextField("https://…", text: $controllerText)
                 .textFieldStyle(.roundedBorder).font(.system(size: 11, design: .monospaced))
-                .onSubmit { sync.setController(controllerText) }
+                .onSubmit { saveConnection() }
+            HStack(spacing: 8) {
+                TextField("SOCKS5 代理，可选择或填写，如 127.0.0.1:1085", text: $proxyText)
+                    .textFieldStyle(.roundedBorder).font(.system(size: 11, design: .monospaced))
+                    .onSubmit { saveConnection() }
+                Menu(proxyMenuTitle) {
+                    Button("直连（不使用代理）") { chooseProxy("") }
+                    Divider()
+                    ForEach(socksProxyPresets) { preset in
+                        Button("\(preset.name)（\(String(preset.port))）") { chooseProxy(preset.address) }
+                    }
+                }
+                .controlSize(.small).fixedSize()
+            }
             HStack {
                 Text(sync.hasToken ? "只读令牌已保存在钥匙串" : "尚未设置只读令牌")
                     .font(.system(size: 10)).foregroundStyle(.secondary)
                 Spacer()
                 Button(sync.hasToken ? "更换令牌" : "设置令牌") { showToken = true }.controlSize(.small)
                 Button("刷新") {
-                    sync.setController(controllerText)
+                    saveConnection()
                     Task { await sync.refresh() }
                 }
                 .controlSize(.small).disabled(sync.isBusy || !sync.hasToken)
@@ -102,6 +119,21 @@ struct SSHSyncView: View {
         .padding(15).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(UITheme.panel, in: RoundedRectangle(cornerRadius: 13))
         .overlay(RoundedRectangle(cornerRadius: 13).strokeBorder(UITheme.line))
+    }
+
+    private var proxyMenuTitle: String {
+        if proxyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "直连" }
+        return socksProxyPreset(matching: proxyText)?.name ?? "自定义"
+    }
+
+    private func chooseProxy(_ address: String) {
+        proxyText = address
+        saveConnection()
+        if sync.hasToken { Task { await sync.refresh() } }
+    }
+
+    private func saveConnection() {
+        sync.setConnection(controller: controllerText, socksProxy: proxyText)
     }
 
     private var includeCard: some View {
@@ -155,6 +187,9 @@ struct SSHSyncView: View {
                 Text("\(sync.settings.mappings.count) 个").font(.system(size: 11)).foregroundStyle(.secondary)
                 Spacer()
                 if sync.isBusy { ProgressView().controlSize(.small) }
+                if !sync.settings.mappings.isEmpty {
+                    SSHSearchField(placeholder: "搜索 Host、设备或地址", text: $mappingSearch).frame(width: 230)
+                }
             }
             .padding(.horizontal, 17).padding(.vertical, 13)
             Rectangle().fill(UITheme.line).frame(height: 1)
@@ -168,9 +203,12 @@ struct SSHSyncView: View {
             } else {
                 ScrollView {
                     LazyVStack(spacing: 0) {
-                        ForEach(sync.settings.mappings) { mapping in
+                        ForEach(filterSSHMappings(sync.settings.mappings, query: mappingSearch)) { mapping in
                             mappingRow(mapping)
                             Rectangle().fill(UITheme.line).frame(height: 1)
+                        }
+                        if filterSSHMappings(sync.settings.mappings, query: mappingSearch).isEmpty {
+                            Text("没有匹配的 Host").font(.system(size: 12)).foregroundStyle(.secondary).padding(30)
                         }
                     }
                 }
@@ -195,6 +233,7 @@ struct SSHSyncView: View {
                 ForEach(SSHAddressPolicy.allCases) { Text($0.title).tag($0) }
             }
             .labelsHidden().controlSize(.small).frame(width: 135)
+            jumpButton(mapping)
             addressColumn(mapping)
             Spacer(minLength: 6)
             stateBadge(sync.state(of: mapping))
@@ -202,6 +241,48 @@ struct SSHSyncView: View {
                 .buttonStyle(.plain).foregroundStyle(.secondary).help("移除")
         }
         .padding(.horizontal, 17).padding(.vertical, 11)
+    }
+
+    private func jumpLabel(_ mapping: SSHMapping) -> String {
+        switch mapping.proxyJump {
+        case sshProxyJumpNone?: return "直连"
+        case let jump?: return jump
+        case nil:
+            let host = sync.effectiveHost(for: mapping.hostAlias)
+            if host?.usesProxyCommand == true { return "沿用：ProxyCommand" }
+            if let jump = host?.proxyJump, jump != sshProxyJumpNone { return "沿用：\(jump)" }
+            return "沿用：直连"
+        }
+    }
+
+    private func jumpButton(_ mapping: SSHMapping) -> some View {
+        Button { editingJump = mapping.id } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.triangle.turn.up.right.diamond").font(.system(size: 10))
+                Text(jumpLabel(mapping)).font(.system(size: 11)).lineLimit(1).truncationMode(.middle)
+            }
+            .frame(width: 125, alignment: .leading)
+        }
+        .controlSize(.small)
+        .help("跳板（ProxyJump）")
+        .popover(isPresented: Binding(
+            get: { editingJump == mapping.id },
+            set: { if !$0 { editingJump = nil } }
+        )) {
+            VStack(alignment: .leading, spacing: 10) {
+                SSHJumpList(
+                    hosts: sync.hosts.filter { $0.alias != mapping.hostAlias && isSafeSSHAlias($0.alias) },
+                    selection: Binding(
+                        get: { mapping.proxyJump },
+                        set: { jump in
+                            sync.setProxyJump(jump, for: mapping)
+                            editingJump = nil
+                        }
+                    )
+                )
+            }
+            .padding(14).frame(width: 400)
+        }
     }
 
     private func addressColumn(_ mapping: SSHMapping) -> some View {
@@ -247,6 +328,89 @@ struct SSHSyncView: View {
     }
 }
 
+private struct SSHSearchField: View {
+    var placeholder: String
+    @Binding var text: String
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "magnifyingglass").font(.system(size: 11)).foregroundStyle(.secondary)
+            TextField(placeholder, text: $text).textFieldStyle(.plain).font(.system(size: 12))
+            if !text.isEmpty {
+                Button { text = "" } label: { Image(systemName: "xmark.circle.fill") }
+                    .buttonStyle(.plain).foregroundStyle(.tertiary).help("清除")
+            }
+        }
+        .padding(.horizontal, 9).padding(.vertical, 6)
+        .background(UITheme.muted, in: RoundedRectangle(cornerRadius: 7))
+    }
+}
+
+private struct SSHHostRow: View {
+    var title: String
+    var detail: String
+    var selected: Bool
+    var action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 12))
+                    .foregroundStyle(selected ? UITheme.accent : Color.secondary.opacity(0.5))
+                Text(title).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                Spacer(minLength: 12)
+                Text(detail).font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+            }
+            .padding(.horizontal, 10).padding(.vertical, 7)
+            .background(selected ? UITheme.accent.opacity(0.10) : Color.clear)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// Keep the main config's jump, connect directly, or pick a Host. Searching
+/// narrows the Hosts only, so the first two stay one click away.
+struct SSHJumpList: View {
+    var hosts: [SSHEffectiveHost]
+    @Binding var selection: String?
+    var listHeight: CGFloat = 230
+    @State private var search = ""
+
+    var body: some View {
+        let matches = filterSSHHosts(hosts, query: search)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("跳板（ProxyJump）").font(.system(size: 12, weight: .medium))
+                Text("\(matches.count) / \(hosts.count)").font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+            SSHSearchField(placeholder: "搜索跳板 Host 或地址", text: $search)
+            VStack(spacing: 0) {
+                SSHHostRow(title: "沿用主配置", detail: "默认", selected: selection == nil) { selection = nil }
+                SSHHostRow(title: "直连", detail: "不走跳板", selected: selection == sshProxyJumpNone) { selection = sshProxyJumpNone }
+                Rectangle().fill(UITheme.line).frame(height: 1)
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(matches) { host in
+                            SSHHostRow(title: host.alias, detail: host.display, selected: selection == host.alias) {
+                                selection = host.alias
+                            }
+                        }
+                        if matches.isEmpty {
+                            Text("没有匹配的 Host").font(.system(size: 11)).foregroundStyle(.secondary).padding(18)
+                        }
+                    }
+                }
+                .frame(height: listHeight)
+            }
+            .background(UITheme.panel, in: RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(UITheme.line))
+        }
+    }
+}
+
 struct SSHMappingEditor: View {
     @ObservedObject var sync: SSHSyncModel
     @Environment(\.dismiss) private var dismiss
@@ -255,6 +419,8 @@ struct SSHMappingEditor: View {
     @State private var policy = SSHAddressPolicy.lanIPv4
     @State private var forwardTarget = ""
     @State private var error: String?
+    @State private var hostSearch = ""
+    @State private var proxyJump: String?
 
     private var device: NetbridgeDevice? { sync.devices.first { $0.keyID == deviceID } }
     private var aliases: [SSHEffectiveHost] { sync.hosts.filter { !sync.mappedAliases.contains($0.alias) && isSafeSSHAlias($0.alias) } }
@@ -273,9 +439,6 @@ struct SSHMappingEditor: View {
                 Picker("B 端设备", selection: $deviceID) {
                     ForEach(sync.devices) { Text($0.label).tag($0.keyID) }
                 }
-                Picker("SSH Host", selection: $alias) {
-                    ForEach(aliases) { Text("\($0.alias)   \($0.display)").tag($0.alias) }
-                }
                 Picker("地址类型", selection: $policy) {
                     ForEach(SSHAddressPolicy.allCases) { Text($0.title).tag($0) }
                 }
@@ -290,6 +453,12 @@ struct SSHMappingEditor: View {
                     Text(preview).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
                 }
             }
+            hostPicker
+            SSHJumpList(
+                hosts: sync.hosts.filter { $0.alias != alias && isSafeSSHAlias($0.alias) },
+                selection: $proxyJump,
+                listHeight: 110
+            )
             if let error {
                 Text(error).font(.system(size: 11)).foregroundStyle(.orange)
             }
@@ -299,7 +468,8 @@ struct SSHMappingEditor: View {
                 Button("添加") {
                     guard let device else { return }
                     error = sync.addMapping(device: device, alias: alias, policy: policy,
-                                            forwardTarget: forwardTarget.isEmpty ? nil : forwardTarget)
+                                            forwardTarget: forwardTarget.isEmpty ? nil : forwardTarget,
+                                            proxyJump: proxyJump)
                     if error == nil { dismiss() }
                 }
                 .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
@@ -313,6 +483,37 @@ struct SSHMappingEditor: View {
             selectDefaultForward()
         }
         .onChange(of: deviceID) { selectDefaultForward() }
+    }
+
+    private var hostPicker: some View {
+        let matches = filterSSHHosts(aliases, query: hostSearch)
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("SSH Host").font(.system(size: 12, weight: .medium))
+                Text("\(matches.count) / \(aliases.count)").font(.system(size: 10)).foregroundStyle(.secondary)
+                Spacer()
+                if !alias.isEmpty {
+                    Text("已选：\(alias)").font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(UITheme.accent).lineLimit(1)
+                }
+            }
+            SSHSearchField(placeholder: "搜索 Host 名称或地址，可用空格分隔多个词", text: $hostSearch)
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(matches) { host in
+                        SSHHostRow(title: host.alias, detail: host.display, selected: alias == host.alias) {
+                            alias = host.alias
+                        }
+                    }
+                    if matches.isEmpty {
+                        Text("没有匹配的 Host").font(.system(size: 11)).foregroundStyle(.secondary).padding(24)
+                    }
+                }
+            }
+            .frame(height: 150)
+            .background(UITheme.panel, in: RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(UITheme.line))
+        }
     }
 
     private func selectDefaultForward() {
