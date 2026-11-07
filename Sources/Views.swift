@@ -411,7 +411,7 @@ struct MainView: View {
                     Text(entry.name.isEmpty ? "未命名服务器" : entry.name)
                         .font(.system(size: 12, weight: .semibold)).lineLimit(1)
                     if !entry.sources.isEmpty {
-                        Text(entry.isWeChatAutomatic ? "微信自动" : (entry.sources.contains(where: { $0.lowercased().contains("ssh") }) ? "SSH" : "手动"))
+                        Text(entry.isWeChatAutomatic ? "微信自动" : entry.automaticSource == sshDynamicAutomaticSource ? "SSH 动态" : (entry.sources.contains(where: { $0.lowercased().contains("ssh") }) ? "SSH" : "手动"))
                             .font(.system(size: 8, weight: .semibold))
                             .foregroundStyle(.secondary)
                             .padding(.horizontal, 5).padding(.vertical, 2)

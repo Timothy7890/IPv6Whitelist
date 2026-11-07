@@ -11,6 +11,9 @@ struct SSHSyncView: View {
     @State private var pendingRemove: SSHMapping?
     @State private var mappingSearch = ""
     @State private var editingJump: UUID?
+    @State private var expandedGroups = Set<UUID>()
+    @State private var editingGroup: SSHJumpGroup?
+    @State private var pendingRemoveGroup: SSHJumpGroup?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -38,6 +41,19 @@ struct SSHSyncView: View {
         }
         .sheet(isPresented: $showAdd) { SSHMappingEditor(sync: sync) }
         .sheet(isPresented: $showToken) { SSHTokenEditor(sync: sync) }
+        .sheet(item: $editingGroup) { SSHMappingEditor(sync: sync, editing: $0) }
+        .alert("移除这个组合？", isPresented: Binding(
+            get: { pendingRemoveGroup != nil },
+            set: { if !$0 { pendingRemoveGroup = nil } }
+        )) {
+            Button("取消", role: .cancel) { pendingRemoveGroup = nil }
+            Button("移除", role: .destructive) {
+                if let group = pendingRemoveGroup { sync.removeJumpGroup(group) }
+                pendingRemoveGroup = nil
+            }
+        } message: {
+            Text("组合里的 \(pendingRemoveGroup?.members.count ?? 0) 个 Host 都会恢复使用 ~/.ssh/config 中原有的跳板设置。")
+        }
         .alert("修改 ~/.ssh/config？", isPresented: $confirmInclude) {
             Button("取消", role: .cancel) {}
             Button("备份并添加") { sync.enableInclude() }
@@ -67,7 +83,7 @@ struct SSHSyncView: View {
             }
             Spacer()
             Button { showAdd = true } label: { Label("添加 Host", systemImage: "plus") }
-                .controlSize(.large).disabled(sync.devices.isEmpty)
+                .controlSize(.large).disabled(sync.devices.isEmpty && sync.hosts.isEmpty)
             Button {
                 saveConnection()
                 Task { await sync.updateAll() }
@@ -204,11 +220,14 @@ struct SSHSyncView: View {
             } else {
                 ScrollView {
                     LazyVStack(spacing: 0) {
-                        ForEach(filterSSHMappings(sync.settings.mappings, query: mappingSearch)) { mapping in
-                            mappingRow(mapping)
+                        ForEach(visibleRows) { row in
+                            switch row {
+                            case .single(let mapping): mappingRow(mapping)
+                            case .group(let group): groupRow(group)
+                            }
                             Rectangle().fill(UITheme.line).frame(height: 1)
                         }
-                        if filterSSHMappings(sync.settings.mappings, query: mappingSearch).isEmpty {
+                        if visibleRows.isEmpty {
                             Text("没有匹配的 Host").font(.system(size: 12)).foregroundStyle(.secondary).padding(30)
                         }
                     }
@@ -218,6 +237,105 @@ struct SSHSyncView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(UITheme.panel, in: RoundedRectangle(cornerRadius: 13))
         .overlay(RoundedRectangle(cornerRadius: 13).strokeBorder(UITheme.line))
+    }
+
+    /// A group stays whole when any member matches, so its jump is never edited
+    /// while part of it is hidden.
+    private var visibleRows: [SSHMappingRow] {
+        let matched = Set(filterSSHMappings(sync.settings.mappings, query: mappingSearch).map(\.id))
+        return sshMappingRows(sync.settings.mappings).filter { row in
+            switch row {
+            case .single(let mapping): return matched.contains(mapping.id)
+            case .group(let group): return group.members.contains { matched.contains($0.id) }
+            }
+        }
+    }
+
+    private func groupRow(_ group: SSHJumpGroup) -> some View {
+        let expanded = expandedGroups.contains(group.id) || !mappingSearch.isEmpty
+        return VStack(spacing: 0) {
+            HStack(alignment: .center, spacing: 14) {
+                Button {
+                    if expandedGroups.remove(group.id) == nil { expandedGroups.insert(group.id) }
+                } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary).frame(width: 10)
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text(group.title).font(.system(size: 13, weight: .semibold)).lineLimit(1).truncationMode(.middle)
+                            Text(sshJumpOnlyLabel).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .frame(width: 282, alignment: .leading)
+                groupJumpButton(group)
+                Text(group.aliases.joined(separator: "、"))
+                    .font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+                    .help(group.aliases.joined(separator: "\n"))
+                    .frame(minWidth: 180, maxWidth: .infinity, alignment: .leading)
+                Spacer(minLength: 6)
+                Text("组合").font(.system(size: 10, weight: .medium)).foregroundStyle(UITheme.accent)
+                    .padding(.horizontal, 9).padding(.vertical, 4)
+                    .background(UITheme.accent.opacity(0.1), in: Capsule())
+                Button { editingGroup = group } label: { Image(systemName: "pencil") }
+                    .buttonStyle(.plain).foregroundStyle(.secondary).help("编辑组合")
+                Button { pendingRemoveGroup = group } label: { Image(systemName: "trash") }
+                    .buttonStyle(.plain).foregroundStyle(.secondary).help("移除组合")
+            }
+            .padding(.horizontal, 17).padding(.vertical, 11)
+            if expanded {
+                VStack(spacing: 0) {
+                    ForEach(group.members) { member in
+                        HStack(spacing: 14) {
+                            Text(member.hostAlias).font(.system(size: 11, weight: .medium)).lineLimit(1)
+                                .frame(width: 180, alignment: .leading)
+                            Text(sync.effectiveHost(for: member.hostAlias)?.display ?? "未配置")
+                                .font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
+                                .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                            Spacer()
+                        }
+                        .padding(.vertical, 5)
+                    }
+                }
+                .padding(.leading, 34).padding(.trailing, 17).padding(.bottom, 9)
+            }
+        }
+    }
+
+    private func groupJumpButton(_ group: SSHJumpGroup) -> some View {
+        Button { editingJump = group.id } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.triangle.turn.up.right.diamond").font(.system(size: 10))
+                Text(group.proxyJump == sshProxyJumpNone ? "直连" : group.proxyJump ?? "未设置")
+                    .font(.system(size: 11)).lineLimit(1).truncationMode(.middle)
+            }
+            .frame(width: 125, alignment: .leading)
+        }
+        .controlSize(.small)
+        .help("整个组合的跳板（ProxyJump）")
+        .popover(isPresented: Binding(
+            get: { editingJump == group.id },
+            set: { if !$0 { editingJump = nil } }
+        )) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("修改后组合里的 \(group.members.count) 个 Host 一起生效")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                SSHJumpList(
+                    hosts: sync.hosts.filter { !group.aliases.contains($0.alias) && isSafeSSHAlias($0.alias) },
+                    selection: Binding(
+                        get: { group.proxyJump },
+                        set: { jump in
+                            sync.errorText = sync.saveJumpGroup(id: group.id, aliases: group.aliases, proxyJump: jump)
+                            editingJump = nil
+                        }
+                    ),
+                    autoFocus: true
+                )
+            }
+            .padding(14).frame(width: 400)
+        }
     }
 
     private func mappingRow(_ mapping: SSHMapping) -> some View {
@@ -308,6 +426,7 @@ struct SSHSyncView: View {
         case .pending: (text, color) = ("待更新", .blue)
         case .offline: (text, color) = ("设备离线", .secondary)
         case .noAddress: (text, color) = ("无此类地址", .orange)
+        case .jumpOnly: (text, color) = ("仅跳板", .secondary)
         }
         return Text(text).font(.system(size: 10, weight: .medium)).foregroundStyle(color)
             .padding(.horizontal, 9).padding(.vertical, 4)
@@ -316,7 +435,7 @@ struct SSHSyncView: View {
 
     private var footer: some View {
         HStack {
-            Text("设备离线时保留上次地址。IP 变化不会要求重新信任主机，但 Host 第一次走这里更新时会询问一次主机指纹。")
+            Text("设备离线时保留上次地址。公网 IPv6 会自动加入白名单。IP 变化不会要求重新信任主机，但 Host 第一次走这里更新时会询问一次主机指纹。")
                 .font(.system(size: 10)).foregroundStyle(.secondary)
             Spacer()
             if let date = sync.lastFetched {
@@ -398,6 +517,7 @@ private struct SSHSearchTextField: NSViewRepresentable {
 
     func updateNSView(_ field: Field, context: Context) {
         context.coordinator.parent = self
+        if field.placeholderString != placeholder { field.placeholderString = placeholder }
         let composing = (field.currentEditor() as? NSTextView)?.hasMarkedText() ?? false
         if !composing, field.stringValue != text { field.stringValue = text }
     }
@@ -430,12 +550,18 @@ private struct SSHHostRow: View {
     var detail: String
     var selected: Bool
     var highlighted = false
+    var multiple = false
     var action: () -> Void
+
+    private var icon: String {
+        if multiple { return selected ? "checkmark.square.fill" : "square" }
+        return selected ? "checkmark.circle.fill" : "circle"
+    }
 
     var body: some View {
         Button(action: action) {
             HStack(spacing: 10) {
-                Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                Image(systemName: icon)
                     .font(.system(size: 12))
                     .foregroundStyle(selected ? UITheme.accent : Color.secondary.opacity(0.5))
                 Text(title).font(.system(size: 12, weight: .medium)).lineLimit(1)
@@ -539,7 +665,12 @@ struct SSHJumpList: View {
 }
 
 struct SSHMappingEditor: View {
+    // Control characters cannot appear in a key ID, so this never collides with one.
+    private static let noRemoteID = "\u{1}no-remote"
+
     @ObservedObject var sync: SSHSyncModel
+    /// Editing an existing group instead of adding a Host.
+    var editing: SSHJumpGroup? = nil
     @Environment(\.dismiss) private var dismiss
     @State private var deviceID = ""
     @State private var alias = ""
@@ -549,9 +680,18 @@ struct SSHMappingEditor: View {
     @State private var hostSearch = ""
     @State private var highlightedHost: String?
     @State private var proxyJump: String?
+    @State private var checkedAliases = Set<String>()
 
+    private var isNoRemote: Bool { deviceID == Self.noRemoteID }
+    private var sortedChecked: [String] {
+        checkedAliases.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
     private var device: NetbridgeDevice? { sync.devices.first { $0.keyID == deviceID } }
-    private var aliases: [SSHEffectiveHost] { sync.hosts.filter { !sync.mappedAliases.contains($0.alias) && isSafeSSHAlias($0.alias) } }
+    private var aliases: [SSHEffectiveHost] {
+        sync.hosts.filter { host in
+            (!sync.mappedAliases.contains(host.alias) || editing?.aliases.contains(host.alias) == true) && isSafeSSHAlias(host.alias)
+        }
+    }
 
     private var preview: String {
         guard let device else { return "—" }
@@ -562,64 +702,109 @@ struct SSHMappingEditor: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("添加 Host").font(.title2.weight(.bold))
+            Text(editing == nil ? "添加 Host" : "编辑组合").font(.title2.weight(.bold))
             Form {
-                Picker("B 端设备", selection: $deviceID) {
-                    ForEach(sync.devices) { Text($0.label).tag($0.keyID) }
-                }
-                Picker("地址类型", selection: $policy) {
-                    ForEach(SSHAddressPolicy.allCases) { Text($0.title).tag($0) }
-                }
-                if policy == .tunnelEntry {
-                    Picker("转发目标", selection: $forwardTarget) {
-                        ForEach(device?.forwards ?? []) {
-                            Text("\($0.localAddress)（\($0.publicAddress)）").tag($0.localAddress)
-                        }
+                if editing == nil {
+                    Picker("B 端设备", selection: $deviceID) {
+                        ForEach(sync.devices) { Text($0.label).tag($0.keyID) }
+                        if !sync.devices.isEmpty { Divider() }
+                        Text(sshJumpOnlyLabel).tag(Self.noRemoteID)
                     }
                 }
-                LabeledContent("将写入") {
-                    Text(preview).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+                if isNoRemote {
+                    LabeledContent("将写入") {
+                        Text("只写入跳板，不更新地址").font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                } else {
+                    Picker("地址类型", selection: $policy) {
+                        ForEach(SSHAddressPolicy.allCases) { Text($0.title).tag($0) }
+                    }
+                    if policy == .tunnelEntry {
+                        Picker("转发目标", selection: $forwardTarget) {
+                            ForEach(device?.forwards ?? []) {
+                                Text("\($0.localAddress)（\($0.publicAddress)）").tag($0.localAddress)
+                            }
+                        }
+                    }
+                    LabeledContent("将写入") {
+                        Text(preview).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+                    }
                 }
             }
             hostPicker
             SSHJumpList(
-                hosts: sync.hosts.filter { $0.alias != alias && isSafeSSHAlias($0.alias) },
+                hosts: sync.hosts.filter { host in
+                    isSafeSSHAlias(host.alias) && (isNoRemote ? !checkedAliases.contains(host.alias) : host.alias != alias)
+                },
                 selection: $proxyJump,
                 listHeight: 110
             )
             if let error {
                 Text(error).font(.system(size: 11)).foregroundStyle(.orange)
+            } else if isNoRemote, !checkedAliases.isEmpty, proxyJump == nil {
+                Text("“沿用主配置”不会写入任何内容，请选择跳板或直连。")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
             }
             HStack {
                 Spacer()
                 Button("取消", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("添加") {
-                    guard let device else { return }
-                    error = sync.addMapping(device: device, alias: alias, policy: policy,
-                                            forwardTarget: forwardTarget.isEmpty ? nil : forwardTarget,
-                                            proxyJump: proxyJump)
+                Button(confirmTitle) {
+                    if let editing {
+                        error = sync.saveJumpGroup(id: editing.id, aliases: sortedChecked, proxyJump: proxyJump)
+                    } else if isNoRemote {
+                        error = sync.addJumpOnlyMappings(aliases: sortedChecked, proxyJump: proxyJump)
+                    } else {
+                        guard let device else { return }
+                        error = sync.addMapping(device: device, alias: alias, policy: policy,
+                                                forwardTarget: forwardTarget.isEmpty ? nil : forwardTarget,
+                                                proxyJump: proxyJump)
+                    }
                     if error == nil { dismiss() }
                 }
                 .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
-                .disabled(device == nil || alias.isEmpty)
+                .disabled(isNoRemote ? checkedAliases.isEmpty || proxyJump == nil : device == nil || alias.isEmpty)
             }
         }
         .padding(24).frame(width: 520)
         .onAppear {
-            deviceID = sync.devices.first?.keyID ?? ""
+            if let editing {
+                deviceID = Self.noRemoteID
+                checkedAliases = Set(editing.aliases)
+                proxyJump = editing.proxyJump
+                return
+            }
+            deviceID = sync.devices.first?.keyID ?? Self.noRemoteID
             alias = aliases.first(where: { $0.alias == device?.label })?.alias ?? aliases.first?.alias ?? ""
             selectDefaultForward()
         }
-        .onChange(of: deviceID) { selectDefaultForward() }
+        .onChange(of: deviceID) {
+            selectDefaultForward()
+            error = nil
+        }
+    }
+
+    private var confirmTitle: String {
+        guard isNoRemote, !checkedAliases.isEmpty else { return editing == nil ? "添加" : "保存" }
+        return "\(editing == nil ? "添加" : "保存")（\(checkedAliases.count)）"
+    }
+
+    private func toggleChecked(_ alias: String) {
+        if checkedAliases.remove(alias) == nil { checkedAliases.insert(alias) }
+        error = nil
+    }
+
+    /// Multi-select toggles, so the list stays open for picking more.
+    private func pickHost(_ picked: String) {
+        if isNoRemote { toggleChecked(picked) } else { alias = picked }
     }
 
     private func pressReturnInHosts(_ matches: [SSHEffectiveHost]) -> Bool {
         if let highlightedHost {
-            alias = highlightedHost
+            pickHost(highlightedHost)
             return true
         }
         if hostSearch.isEmpty { return false }
-        if matches.count == 1 { alias = matches[0].alias }
+        if matches.count == 1 { pickHost(matches[0].alias) }
         return true
     }
 
@@ -630,21 +815,32 @@ struct SSHMappingEditor: View {
                 Text("SSH Host").font(.system(size: 12, weight: .medium))
                 Text("\(matches.count) / \(aliases.count)").font(.system(size: 10)).foregroundStyle(.secondary)
                 Spacer()
-                if !alias.isEmpty {
+                if isNoRemote {
+                    if !checkedAliases.isEmpty {
+                        Text("已选 \(checkedAliases.count) 个：\(sortedChecked.joined(separator: "、"))")
+                            .font(.system(size: 11, weight: .medium)).foregroundStyle(UITheme.accent)
+                            .lineLimit(1).truncationMode(.tail)
+                            .help(sortedChecked.joined(separator: "\n"))
+                        Button("清空") { checkedAliases = [] }
+                            .buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(.secondary)
+                    }
+                } else if !alias.isEmpty {
                     Text("已选：\(alias)").font(.system(size: 11, weight: .medium))
                         .foregroundStyle(UITheme.accent).lineLimit(1)
                 }
             }
-            SSHSearchField(placeholder: "搜索 Host 名称或地址，↑↓ 选择，⏎ 确认", text: $hostSearch, autoFocus: true,
+            SSHSearchField(placeholder: isNoRemote ? "搜索 Host 名称或地址，↑↓ 选择，⏎ 勾选（可多选）" : "搜索 Host 名称或地址，↑↓ 选择，⏎ 确认",
+                           text: $hostSearch, autoFocus: true,
                            onMove: { highlightedHost = movedHighlight(current: highlightedHost, items: matches.map(\.alias), delta: $0) },
                            onReturn: { pressReturnInHosts(matches) })
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 0) {
                         ForEach(matches) { host in
-                            SSHHostRow(title: host.alias, detail: host.display, selected: alias == host.alias,
-                                       highlighted: highlightedHost == host.alias) {
-                                alias = host.alias
+                            SSHHostRow(title: host.alias, detail: host.display,
+                                       selected: isNoRemote ? checkedAliases.contains(host.alias) : alias == host.alias,
+                                       highlighted: highlightedHost == host.alias, multiple: isNoRemote) {
+                                pickHost(host.alias)
                             }
                             .id(host.alias)
                         }

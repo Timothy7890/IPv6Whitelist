@@ -177,6 +177,30 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Returns a sentence for the user when something was changed or skipped.
+    func syncSSHDynamicAddresses(_ wanted: [String: [String]]) -> String? {
+        guard storeWritable else { return "白名单文件损坏，动态地址没有写入白名单。" }
+        let merged = mergeDynamicWhitelist(entries, wanted: wanted,
+                                           excluded: weChatSettings.excludedAddresses, now: Date())
+        let prior = entries
+        entries = normalized(merged.entries)
+        if entries != prior {
+            guard saveEntries() else {
+                entries = prior
+                return "保存白名单失败，动态地址没有写入白名单。"
+            }
+            merged.added.forEach { log("SSH 动态地址加入白名单：\($0)") }
+            merged.removed.forEach { log("SSH 动态地址移出白名单：\($0)") }
+            syncEntries()
+        }
+        var parts: [String] = []
+        if !merged.added.isEmpty { parts.append("白名单新增 \(merged.added.count) 个地址") }
+        if !merged.removed.isEmpty { parts.append("移除 \(merged.removed.count) 个旧地址") }
+        if !merged.excluded.isEmpty { parts.append("\(merged.excluded.count) 个地址曾被手动移出，未加入") }
+        if !merged.overCapacity.isEmpty { parts.append("白名单已满，\(merged.overCapacity.count) 个地址未加入") }
+        return parts.isEmpty ? nil : parts.joined(separator: "，")
+    }
+
     private func syncEntries() {
         needsRouteSync = true
         guard helperReady else { refresh(); return }

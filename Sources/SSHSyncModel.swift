@@ -55,11 +55,13 @@ enum SSHMappingState: Equatable {
     case pending(SSHTarget)
     case offline
     case noAddress
+    case jumpOnly
 }
 
 @MainActor
 final class SSHSyncModel: ObservableObject {
-    static let shared = SSHSyncModel(log: { AppModel.shared.log($0) })
+    static let shared = SSHSyncModel(log: { AppModel.shared.log($0) },
+                                     syncWhitelist: { AppModel.shared.syncSSHDynamicAddresses($0) })
 
     @Published private(set) var settings = SSHSyncSettings()
     @Published private(set) var devices: [NetbridgeDevice] = []
@@ -75,17 +77,20 @@ final class SSHSyncModel: ObservableObject {
     private let tokenStore: SSHSyncTokenStore
     private let settingsURL: URL
     private let log: (String) -> Void
+    private let syncWhitelist: ([String: [String]]) -> String?
     private var settingsWritable = true
 
     init(paths: SSHSyncPaths = .standard,
          tokenStore: SSHSyncTokenStore = KeychainTokenStore(),
          settingsURL: URL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/IPv6Whitelist/ssh-config-sync.json"),
-         log: @escaping (String) -> Void) {
+         log: @escaping (String) -> Void,
+         syncWhitelist: @escaping ([String: [String]]) -> String? = { _ in nil }) {
         self.paths = paths
         self.tokenStore = tokenStore
         self.settingsURL = settingsURL
         self.log = log
+        self.syncWhitelist = syncWhitelist
         loadSettings()
         reloadLocalState()
         hasToken = tokenStore.read() != nil
@@ -109,6 +114,7 @@ final class SSHSyncModel: ObservableObject {
     }
 
     func state(of mapping: SSHMapping) -> SSHMappingState {
+        if mapping.isJumpOnly { return .jumpOnly }
         guard let device = device(for: mapping) else { return .offline }
         guard let target = resolveSSHTarget(mapping, device: device) else { return .noAddress }
         return target == mapping.applied ? .upToDate : .pending(target)
@@ -250,6 +256,63 @@ final class SSHSyncModel: ObservableObject {
         return nil
     }
 
+    /// Takes effect right away, so it needs the Include to be active. Returns an
+    /// error to show in the sheet, or nil on success; nothing is written on error.
+    func addJumpOnlyMappings(aliases: [String], proxyJump: String?) -> String? {
+        guard includeStatus == .active else { return "请先启用 SSH 配置中的 Include。" }
+        var updated = settings.mappings
+        do {
+            updated += try makeJumpOnlyMappings(aliases: aliases, jump: proxyJump, hosts: hosts, existing: updated)
+            updated.sort { $0.hostAlias.localizedStandardCompare($1.hostAlias) == .orderedAscending }
+            try writeDynamicSSHConfig(renderDynamicSSHConfig(updated), paths: paths)
+        } catch let error as SSHSyncError {
+            return error.localizedDescription
+        } catch {
+            return "写入 SSH 配置失败：\(error.localizedDescription)"
+        }
+        settings.mappings = updated
+        saveSettings()
+        reloadLocalState()
+        let jumpText = proxyJump == sshProxyJumpNone ? "直连" : proxyJump ?? ""
+        log("新增无远程配置（跳板：\(jumpText)）：\(aliases.sorted().joined(separator: "、"))")
+        return nil
+    }
+
+    /// Changes a group's members and jump together. Returns an error to show, or
+    /// nil on success; nothing is written on error.
+    func saveJumpGroup(id: UUID, aliases: [String], proxyJump: String?) -> String? {
+        guard includeStatus == .active else { return "请先启用 SSH 配置中的 Include。" }
+        let updated: [SSHMapping]
+        do {
+            updated = try updatingJumpGroup(settings.mappings, id: id, aliases: aliases, jump: proxyJump, hosts: hosts)
+            try writeDynamicSSHConfig(renderDynamicSSHConfig(updated), paths: paths)
+        } catch let error as SSHSyncError {
+            return error.localizedDescription
+        } catch {
+            return "写入 SSH 配置失败：\(error.localizedDescription)"
+        }
+        settings.mappings = updated
+        saveSettings()
+        reloadLocalState()
+        errorText = nil
+        let jumpText = proxyJump == sshProxyJumpNone ? "直连" : proxyJump ?? ""
+        log("组合已更新（跳板：\(jumpText)）：\(aliases.sorted().joined(separator: "、"))")
+        return nil
+    }
+
+    func removeJumpGroup(_ group: SSHJumpGroup) {
+        let remaining = settings.mappings.filter { $0.jumpGroup != group.id }
+        do {
+            try writeDynamicSSHConfig(renderDynamicSSHConfig(remaining), paths: paths)
+            settings.mappings = remaining
+            saveSettings()
+            reloadLocalState()
+            log("移除组合：\(group.aliases.joined(separator: "、"))")
+        } catch {
+            errorText = "写入 SSH 配置失败：\(error.localizedDescription)"
+        }
+    }
+
     func setPolicy(_ policy: SSHAddressPolicy, for mapping: SSHMapping) {
         guard let index = settings.mappings.firstIndex(where: { $0.id == mapping.id }) else { return }
         settings.mappings[index].policy = policy
@@ -270,6 +333,7 @@ final class SSHSyncModel: ObservableObject {
             saveSettings()
             reloadLocalState()
             log("移除 SSH 动态更新：\(mapping.hostAlias)")
+            noticeText = syncWhitelist(dynamicWhitelistAddresses(remaining)).map { "已移除 \(mapping.hostAlias)，\($0)。" }
         } catch {
             errorText = "写入 SSH 配置失败：\(error.localizedDescription)"
         }
@@ -296,7 +360,7 @@ final class SSHSyncModel: ObservableObject {
                 updated[index].applied = target
             case .offline, .noAddress:
                 skipped += 1
-            case .upToDate:
+            case .upToDate, .jumpOnly:
                 break
             }
         }
@@ -312,7 +376,9 @@ final class SSHSyncModel: ObservableObject {
         reloadLocalState()
         changes.forEach { log("SSH 配置已更新 \($0)") }
         let skippedText = skipped > 0 ? "，\(skipped) 个因设备离线或没有对应地址而保留原值" : ""
-        noticeText = changes.isEmpty ? "没有需要更新的地址\(skippedText)。" : "已更新 \(changes.count) 个 Host\(skippedText)。"
+        // Offline devices keep their last address, and so does the whitelist.
+        let whitelistText = syncWhitelist(dynamicWhitelistAddresses(updated)).map { "；\($0)" } ?? ""
+        noticeText = (changes.isEmpty ? "没有需要更新的地址\(skippedText)" : "已更新 \(changes.count) 个 Host\(skippedText)") + whitelistText + "。"
     }
 
     func revealGeneratedFile() {
@@ -323,6 +389,11 @@ final class SSHSyncModel: ObservableObject {
         guard FileManager.default.fileExists(atPath: settingsURL.path) else { return }
         do {
             settings = try JSONDecoder().decode(SSHSyncSettings.self, from: Data(contentsOf: settingsURL))
+            let merged = mergeUngroupedJumpOnly(settings.mappings)
+            if merged != settings.mappings {
+                settings.mappings = merged
+                saveSettings()
+            }
         } catch {
             settingsWritable = false
             errorText = "ssh-config-sync.json 无法读取，已保留原文件，当前不会保存修改。"

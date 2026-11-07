@@ -237,6 +237,126 @@ require(!proxyJumpCreatesCycle(alias: "A", jump: "B", hosts: cycleHosts, mapping
 var looped = mapping(lxz, "D", .lanIPv4); looped.proxyJump = "A"
 require(proxyJumpCreatesCycle(alias: "A", jump: "D", hosts: cycleHosts, mappings: [looped]), "a mapping can create the cycle")
 
+// No remote config: several Hosts share one jump, and only ProxyJump is written.
+let jumpHosts = [
+    SSHEffectiveHost(alias: "A", hostName: "192.0.2.1"),
+    SSHEffectiveHost(alias: "B", hostName: "192.0.2.2"),
+    SSHEffectiveHost(alias: "J", hostName: "192.0.2.3"),
+    SSHEffectiveHost(alias: "K", hostName: "192.0.2.4", proxyJump: "A"),
+]
+let jumpBatch = try makeJumpOnlyMappings(aliases: ["B", "A", "B"], jump: "J", hosts: jumpHosts, existing: [])
+require(jumpBatch.map(\.hostAlias) == ["A", "B"], "batch is sorted without duplicates")
+require(jumpBatch.allSatisfy { $0.isJumpOnly && $0.proxyJump == "J" && $0.applied == nil && $0.deviceLabel == sshJumpOnlyLabel }, "batch shares the jump")
+require(try makeJumpOnlyMappings(aliases: ["A"], jump: sshProxyJumpNone, hosts: jumpHosts, existing: []).first?.proxyJump == "none", "direct is allowed")
+func jumpBatchRefused(_ aliases: [String], _ jump: String?, existing: [SSHMapping] = []) -> Bool {
+    (try? makeJumpOnlyMappings(aliases: aliases, jump: jump, hosts: jumpHosts, existing: existing)) == nil
+}
+require(jumpBatchRefused([], "J"), "no hosts refused")
+require(jumpBatchRefused(["A"], nil), "inherit writes nothing, so it is refused")
+require(jumpBatchRefused(["A"], "a,b"), "unsafe jump refused")
+require(jumpBatchRefused(["A", "a b"], "J"), "one unsafe alias refuses the whole batch")
+require(jumpBatchRefused(["A", "B"], "B"), "jumping through a selected Host refused")
+require(jumpBatchRefused(["A", "B"], "K"), "a cycle through the config refused")
+require(jumpBatchRefused(["A", "B"], "J", existing: [mapping(lxz, "B", .lanIPv4)]), "a Host already configured refuses the batch")
+require(!mapping(lxz, "x", .lanIPv4).isJumpOnly, "real devices are not jump-only")
+require(!filterSSHMappings(jumpBatch, query: "无远程").isEmpty && filterSSHMappings(jumpBatch, query: "局域网").isEmpty, "searched by its label, not a hidden policy")
+
+// The real ssh sees the jump while HostName and everything else stay from the main config.
+let jumpOnlyBatch = try makeJumpOnlyMappings(aliases: ["LXZ-606", "WIN"], jump: "clawd", hosts: [], existing: [])
+try writeDynamicSSHConfig(renderDynamicSSHConfig(jumpOnlyBatch), paths: paths)
+let batchLXZ = try sshG(paths.config, host: "LXZ-606"), batchWIN = try sshG(paths.config, host: "WIN")
+require(batchLXZ["proxyjump"] == "clawd" && batchLXZ["hostname"] == "192.0.2.1" && batchLXZ["user"] == "huawei" && batchLXZ["hostkeyalias"] == nil, "jump-only keeps the address")
+require(batchWIN["proxyjump"] == "clawd" && batchWIN["hostname"] == "192.0.2.2" && batchWIN["port"] == "22", "both Hosts get the jump")
+require(try sshG(paths.config, host: "clawd")["proxyjump"] == nil, "unselected Hosts stay untouched")
+let directBatch = try makeJumpOnlyMappings(aliases: ["LXZ-606"], jump: sshProxyJumpNone, hosts: [], existing: [])
+try writeDynamicSSHConfig(renderDynamicSSHConfig(directBatch), paths: paths)
+require(try sshG(paths.config, host: "LXZ-606")["proxyjump"] == nil, "direct overrides the main config's jump")
+
+// Groups: one row, one jump, changed together.
+require(Set(jumpBatch.map(\.jumpGroup)).count == 1 && jumpBatch[0].jumpGroup != nil, "a batch is one group")
+let otherBatch = try makeJumpOnlyMappings(aliases: ["K"], jump: sshProxyJumpNone, hosts: [], existing: jumpBatch)
+require(otherBatch[0].jumpGroup != jumpBatch[0].jumpGroup, "each batch is its own group")
+let realMapping = mapping(lxz, "Z", .lanIPv4)
+let groupRows = sshMappingRows(jumpBatch + otherBatch + [realMapping])
+require(groupRows.count == 3, "one row per group plus real devices")
+guard case .group(let firstGroup) = groupRows[0], case .single(let single) = groupRows[2] else { fatalError("row kinds") }
+require(firstGroup.aliases == ["A", "B"] && firstGroup.title == "A 等 2 个 Host" && firstGroup.proxyJump == "J", "group row")
+require(single.hostAlias == "Z", "real device stays a single row")
+let groupID = firstGroup.id
+
+let rejumped = try updatingJumpGroup(jumpBatch + otherBatch + [realMapping], id: groupID, aliases: ["A", "B"], jump: "PYX", hosts: jumpHosts)
+require(rejumped.filter { $0.jumpGroup == groupID }.allSatisfy { $0.proxyJump == "PYX" }, "changing the jump changes every member")
+require(rejumped.first { $0.hostAlias == "K" }?.proxyJump == "none" && rejumped.first { $0.hostAlias == "Z" }?.keyID == "k2", "other rows untouched")
+let reshaped = try updatingJumpGroup(jumpBatch, id: groupID, aliases: ["B", "C"], jump: "J", hosts: jumpHosts)
+require(reshaped.map(\.hostAlias) == ["B", "C"] && reshaped.allSatisfy { $0.jumpGroup == groupID }, "members can be added and removed")
+require((try? updatingJumpGroup(jumpBatch, id: groupID, aliases: ["A", "B"], jump: "B", hosts: jumpHosts)) == nil, "group cycle refused")
+require((try? updatingJumpGroup(jumpBatch + [realMapping], id: groupID, aliases: ["A", "Z"], jump: "J", hosts: jumpHosts)) == nil, "a Host with a real device cannot join")
+require((try? updatingJumpGroup(jumpBatch, id: groupID, aliases: [], jump: "J", hosts: jumpHosts)) == nil, "an empty group is refused")
+try writeDynamicSSHConfig(renderDynamicSSHConfig(try updatingJumpGroup(
+    try makeJumpOnlyMappings(aliases: ["LXZ-606", "WIN"], jump: "clawd", hosts: [], existing: [], group: groupID),
+    id: groupID, aliases: ["LXZ-606", "WIN"], jump: sshProxyJumpNone, hosts: [])), paths: paths)
+require(try sshG(paths.config, host: "LXZ-606")["proxyjump"] == nil && (try sshG(paths.config, host: "WIN"))["proxyjump"] == nil, "ssh sees the new jump on every member")
+
+// Hosts saved one by one before groups existed are merged by jump, once.
+var ungroupedA = SSHMapping(keyID: "", deviceLabel: sshJumpOnlyLabel, hostAlias: "a", policy: .lanIPv4, proxyJump: "2004")
+var ungroupedB = ungroupedA; ungroupedB.id = UUID(); ungroupedB.hostAlias = "b"
+var ungroupedC = ungroupedA; ungroupedC.id = UUID(); ungroupedC.hostAlias = "c"; ungroupedC.proxyJump = "other"
+let mergedOld = mergeUngroupedJumpOnly([ungroupedA, ungroupedB, ungroupedC, realMapping])
+require(mergedOld[0].jumpGroup == mergedOld[1].jumpGroup && mergedOld[0].jumpGroup != nil, "same jump merged")
+require(mergedOld[2].jumpGroup != mergedOld[0].jumpGroup, "another jump stays apart")
+require(mergedOld[3].jumpGroup == nil, "real devices never join a group")
+require(mergeUngroupedJumpOnly(mergedOld) == mergedOld, "merging is stable")
+require(renderDynamicSSHConfig(mergedOld) == renderDynamicSSHConfig([ungroupedA, ungroupedB, ungroupedC, realMapping]), "merging leaves the generated file unchanged")
+
+// Dynamic addresses in the whitelist.
+var wlIPv6 = mapping(win, "WIN", .publicIPv6); wlIPv6.applied = SSHTarget(hostName: "2001:DB8::1")
+var wlIPv6Twin = mapping(lxz, "TWIN", .publicIPv6); wlIPv6Twin.applied = SSHTarget(hostName: "2001:db8:0::1")
+var wlIPv4 = mapping(lxz, "LAN", .lanIPv4); wlIPv4.applied = SSHTarget(hostName: "10.0.0.1")
+var wlEntry = mapping(win, "ENTRY", .tunnelEntry); wlEntry.applied = SSHTarget(hostName: "8.136.105.252", port: 20091)
+let wlPending = mapping(win, "PENDING", .publicIPv6)
+var wlJumpOnly = SSHMapping(keyID: "", deviceLabel: sshJumpOnlyLabel, hostAlias: "JUMP", policy: .lanIPv4, proxyJump: "x")
+wlJumpOnly.applied = SSHTarget(hostName: "2001:db8::9")
+let wanted = dynamicWhitelistAddresses([wlIPv6, wlIPv6Twin, wlIPv4, wlEntry, wlPending, wlJumpOnly])
+require(wanted == ["2001:db8::1": ["TWIN", "WIN"]], "only applied IPv6 of real devices, canonical and shared")
+
+let wlNow = Date(timeIntervalSince1970: 1000)
+let manualEntry = WhitelistEntry(address: "2001:db8::2", name: "手动", sources: ["手动添加"])
+let added = mergeDynamicWhitelist([manualEntry], wanted: wanted, excluded: [], now: wlNow)
+require(added.added == ["2001:db8::1"] && added.entries.count == 2, "a new address is added")
+let addedEntry = added.entries.first { $0.address == "2001:db8::1" }!
+require(addedEntry.automaticSource == sshDynamicAutomaticSource && addedEntry.enabled && addedEntry.name.contains("TWIN、WIN"), "owned, enabled and named after its Hosts")
+require(!addedEntry.isWeChatAutomatic, "the WeChat cleanup never touches it")
+require(added.entries.first { $0.address == "2001:db8::2" } == manualEntry, "a manual entry is untouched")
+
+let moved = mergeDynamicWhitelist(added.entries, wanted: ["2001:db8::3": ["WIN"]], excluded: [], now: wlNow)
+require(moved.added == ["2001:db8::3"] && moved.removed == ["2001:db8::1"], "the old address goes when the Host moves")
+require(moved.entries.contains(manualEntry), "moving keeps manual entries")
+let emptied = mergeDynamicWhitelist(moved.entries, wanted: [:], excluded: [], now: wlNow)
+require(emptied.entries == [manualEntry] && emptied.removed == ["2001:db8::3"], "removing the Host removes only what it owned")
+
+let covered = mergeDynamicWhitelist([manualEntry], wanted: ["2001:db8::2": ["WIN"]], excluded: [], now: wlNow)
+require(covered.entries == [manualEntry] && covered.added.isEmpty, "a manual entry already covers the address")
+let keptManual = mergeDynamicWhitelist(covered.entries, wanted: [:], excluded: [], now: wlNow)
+require(keptManual.entries == [manualEntry] && keptManual.removed.isEmpty, "and it stays when the Host moves away")
+
+var disabledOwned = addedEntry; disabledOwned.enabled = false
+require(mergeDynamicWhitelist([disabledOwned], wanted: wanted, excluded: [], now: wlNow).entries[0].enabled == false, "a disabled entry stays disabled")
+let weChatOwned = WhitelistEntry(address: "2001:db8::1", name: "微信", sources: ["微信自动发现"], automaticSource: "wechat")
+let takenOver = mergeDynamicWhitelist([weChatOwned], wanted: wanted, excluded: [], now: wlNow)
+require(takenOver.entries[0].automaticSource == sshDynamicAutomaticSource && takenOver.added.isEmpty, "a WeChat entry is taken over so it cannot expire")
+
+let refused = mergeDynamicWhitelist([], wanted: wanted, excluded: ["2001:db8::1"], now: wlNow)
+require(refused.entries.isEmpty && refused.excluded == ["2001:db8::1"], "an address removed by hand stays out")
+let fullList = (0..<256).map { WhitelistEntry(address: "2001:db8:1::\(String($0, radix: 16))", name: "n") }
+let overflow = mergeDynamicWhitelist(fullList, wanted: wanted, excluded: [], now: wlNow)
+require(overflow.entries.count == 256 && overflow.overCapacity == ["2001:db8::1"], "a full list refuses instead of evicting")
+let stable = mergeDynamicWhitelist(added.entries, wanted: wanted, excluded: [], now: wlNow)
+require(stable.added.isEmpty && stable.removed.isEmpty && stable.entries == added.entries, "nothing changes when nothing moved")
+
+// A saved jump-only mapping round-trips.
+let savedJumpOnly = try JSONDecoder().decode(SSHMapping.self, from: JSONEncoder().encode(jumpBatch[0]))
+require(savedJumpOnly == jumpBatch[0] && savedJumpOnly.isJumpOnly, "jump-only survives saving")
+
 // Settings saved by the previous version still load.
 let oldMapping = try JSONDecoder().decode(SSHMapping.self, from: Data(#"{"id":"00000000-0000-0000-0000-000000000001","keyID":"k","deviceLabel":"d","hostAlias":"h","policy":"lanIPv4"}"#.utf8))
 require(oldMapping.proxyJump == nil, "old mapping decodes as inherit")

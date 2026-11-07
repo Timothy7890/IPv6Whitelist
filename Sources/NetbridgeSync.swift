@@ -121,6 +121,97 @@ struct SSHMapping: Codable, Equatable, Identifiable {
     /// nil keeps the main config's value, sshProxyJumpNone connects directly,
     /// anything else is the Host to jump through.
     var proxyJump: String?
+    /// Jump-only Hosts added together share this and always share one jump.
+    var jumpGroup: UUID?
+
+    /// No device behind it: only proxyJump is written, never an address.
+    /// Real devices always have a key, because keyless tunnels are skipped.
+    var isJumpOnly: Bool { keyID.isEmpty }
+}
+
+let sshJumpOnlyLabel = "无远程配置"
+
+struct SSHJumpGroup: Identifiable, Equatable {
+    var id: UUID
+    var members: [SSHMapping]
+    var proxyJump: String? { members.first?.proxyJump }
+    var aliases: [String] { members.map(\.hostAlias) }
+    var title: String {
+        guard let first = members.first else { return "" }
+        return members.count == 1 ? first.hostAlias : "\(first.hostAlias) 等 \(members.count) 个 Host"
+    }
+}
+
+enum SSHMappingRow: Identifiable, Equatable {
+    case single(SSHMapping)
+    case group(SSHJumpGroup)
+
+    var id: UUID {
+        switch self {
+        case .single(let mapping): return mapping.id
+        case .group(let group): return group.id
+        }
+    }
+}
+
+/// One row per group, placed where its first member sorts.
+func sshMappingRows(_ mappings: [SSHMapping]) -> [SSHMappingRow] {
+    var rows: [SSHMappingRow] = []
+    var seen = Set<UUID>()
+    for mapping in mappings {
+        guard mapping.isJumpOnly, let id = mapping.jumpGroup else {
+            rows.append(.single(mapping))
+            continue
+        }
+        if seen.insert(id).inserted {
+            rows.append(.group(SSHJumpGroup(id: id, members: mappings.filter { $0.jumpGroup == id })))
+        }
+    }
+    return rows
+}
+
+/// Jump-only Hosts saved before groups existed: the same jump becomes one group.
+func mergeUngroupedJumpOnly(_ mappings: [SSHMapping]) -> [SSHMapping] {
+    var groups: [String: UUID] = [:]
+    return mappings.map { mapping in
+        guard mapping.isJumpOnly, mapping.jumpGroup == nil else { return mapping }
+        var mapping = mapping
+        // Control characters cannot appear in a jump, so inherit never collides with one.
+        let key = mapping.proxyJump ?? "\u{1}inherit"
+        let id = groups[key] ?? UUID()
+        groups[key] = id
+        mapping.jumpGroup = id
+        return mapping
+    }
+}
+
+/// Replaces a group's members and jump in one step. Throws without changing
+/// anything if the new group would not work.
+func updatingJumpGroup(_ mappings: [SSHMapping], id: UUID, aliases: [String], jump: String?, hosts: [SSHEffectiveHost]) throws -> [SSHMapping] {
+    let others = mappings.filter { $0.jumpGroup != id }
+    let members = try makeJumpOnlyMappings(aliases: aliases, jump: jump, hosts: hosts, existing: others, group: id)
+    return (others + members).sorted { $0.hostAlias.localizedStandardCompare($1.hostAlias) == .orderedAscending }
+}
+
+/// Builds the new mappings for several Hosts sharing one jump. Throws on the
+/// first problem, so a batch is either added whole or not at all.
+func makeJumpOnlyMappings(aliases: [String], jump: String?, hosts: [SSHEffectiveHost], existing: [SSHMapping], group: UUID = UUID()) throws -> [SSHMapping] {
+    guard !aliases.isEmpty else { throw SSHSyncError.message("请至少选择一个 Host。") }
+    guard let jump else { throw SSHSyncError.message("请选择跳板或直连。") }
+    guard isSafeSSHProxyJump(jump) else { throw SSHSyncError.message("这个跳板名称不能使用。") }
+    let existingAliases = Set(existing.map(\.hostAlias))
+    var added: [SSHMapping] = []
+    let sorted = Set(aliases).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    for alias in sorted {
+        guard isSafeSSHAlias(alias) else { throw SSHSyncError.message("\(alias) 这个 Host 名称不能使用。") }
+        guard !existingAliases.contains(alias) else { throw SSHSyncError.message("\(alias) 已经配置过了。") }
+        // Checked with the earlier ones included: they can close a loop together.
+        if proxyJumpCreatesCycle(alias: alias, jump: jump, hosts: hosts, mappings: existing + added) {
+            throw SSHSyncError.message("\(jump) 最终又会跳回 \(alias)，会形成循环，SSH 无法连接。")
+        }
+        added.append(SSHMapping(keyID: "", deviceLabel: sshJumpOnlyLabel, hostAlias: alias, policy: .lanIPv4, proxyJump: jump, jumpGroup: group))
+    }
+    return added
 }
 
 func isIPLiteral(_ value: String) -> Bool {
@@ -199,6 +290,70 @@ func resolveSSHTarget(_ mapping: SSHMapping, device: NetbridgeDevice) -> SSHTarg
     guard let address = device.addresses.first(where: { $0.kind == kind && $0.primary }),
           isIPLiteral(address.ip) else { return nil }
     return SSHTarget(hostName: address.ip, port: nil)
+}
+
+// MARK: - Whitelist
+
+let sshDynamicAutomaticSource = "ssh-dynamic"
+private let whitelistCapacity = 256
+
+struct DynamicWhitelistMerge {
+    var entries: [WhitelistEntry]
+    var added: [String] = []
+    var removed: [String] = []
+    /// Removed by hand earlier, which is respected until exclusions are reset.
+    var excluded: [String] = []
+    var overCapacity: [String] = []
+}
+
+/// Current IPv6 address → the Hosts using it. IPv4 addresses and names have no
+/// place in the whitelist; jump-only Hosts have no address at all.
+func dynamicWhitelistAddresses(_ mappings: [SSHMapping]) -> [String: [String]] {
+    var wanted: [String: [String]] = [:]
+    for mapping in mappings {
+        guard !mapping.isJumpOnly, let host = mapping.applied?.hostName, let address = canonicalIPv6(host) else { continue }
+        wanted[address, default: []].append(mapping.hostAlias)
+    }
+    return wanted.mapValues { $0.sorted { $0.localizedStandardCompare($1) == .orderedAscending } }
+}
+
+/// Keeps the entries this feature owns equal to `wanted`. Entries added by hand
+/// or imported are never removed or renamed, so an address they already cover
+/// needs nothing. A disabled entry stays disabled.
+func mergeDynamicWhitelist(_ current: [WhitelistEntry], wanted: [String: [String]],
+                           excluded: Set<String>, now: Date) -> DynamicWhitelistMerge {
+    var result = DynamicWhitelistMerge(entries: [])
+    for var entry in current {
+        let isOwned = entry.automaticSource == sshDynamicAutomaticSource
+        guard let aliases = wanted[entry.address] else {
+            if isOwned { result.removed.append(entry.address) } else { result.entries.append(entry) }
+            continue
+        }
+        // A WeChat entry would expire after a week, so a Host's address takes it over.
+        if isOwned || entry.isWeChatAutomatic {
+            entry.automaticSource = sshDynamicAutomaticSource
+            entry.name = "SSH 动态 · \(aliases.joined(separator: "、"))"
+            entry.sources = aliases.map { "SSH 动态更新：\($0)" }
+            entry.lastSeen = now
+        }
+        result.entries.append(entry)
+    }
+    let present = Set(result.entries.map(\.address))
+    for address in wanted.keys.sorted() where !present.contains(address) {
+        let aliases = wanted[address] ?? []
+        if excluded.contains(address) {
+            result.excluded.append(address)
+        } else if result.entries.count >= whitelistCapacity {
+            result.overCapacity.append(address)
+        } else {
+            result.entries.append(WhitelistEntry(
+                address: address, name: "SSH 动态 · \(aliases.joined(separator: "、"))",
+                sources: aliases.map { "SSH 动态更新：\($0)" },
+                automaticSource: sshDynamicAutomaticSource, firstSeen: now, lastSeen: now))
+            result.added.append(address)
+        }
+    }
+    return result
 }
 
 // MARK: - Generated file
@@ -457,7 +612,7 @@ func filterSSHMappings(_ mappings: [SSHMapping], query: String) -> [SSHMapping] 
     let words = query.split(whereSeparator: \.isWhitespace).map(String.init)
     guard !words.isEmpty else { return mappings }
     return mappings.filter { mapping in
-        let fields = [mapping.hostAlias, mapping.deviceLabel, mapping.policy.title, mapping.applied?.display ?? ""]
+        let fields = [mapping.hostAlias, mapping.deviceLabel, mapping.isJumpOnly ? "" : mapping.policy.title, mapping.applied?.display ?? ""]
         return words.allSatisfy { word in fields.contains { $0.localizedCaseInsensitiveContains(word) } }
     }
 }
