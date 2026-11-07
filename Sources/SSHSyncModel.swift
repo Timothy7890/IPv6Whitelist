@@ -231,15 +231,16 @@ final class SSHSyncModel: ObservableObject {
         log("\(mapping.hostAlias) 的跳板改为：\(jump == nil ? "沿用主配置" : jump == sshProxyJumpNone ? "直连" : jump!)")
     }
 
-    func addMapping(device: NetbridgeDevice, alias: String, policy: SSHAddressPolicy, forwardTarget: String?, proxyJump: String? = nil) -> String? {
+    func addMapping(device: NetbridgeDevice, alias: String, policy: SSHAddressPolicy, forward: NetbridgeForward?, proxyJump: String? = nil) -> String? {
         guard isSafeSSHAlias(alias) else { return "这个 Host 名称不能用于自动更新。" }
         guard !mappedAliases.contains(alias) else { return "这个 Host 已经配置过了。" }
-        if policy == .tunnelEntry, forwardTarget == nil { return "请选择要使用的转发目标。" }
+        if policy == .tunnelEntry, forward == nil { return "请选择要使用的入口。" }
         if let problem = proxyJumpError(alias: alias, jump: proxyJump) { return problem }
         var updated = settings.mappings
         updated.append(SSHMapping(
             keyID: device.keyID, deviceLabel: device.label, hostAlias: alias, policy: policy,
-            forwardTarget: policy == .tunnelEntry ? forwardTarget : nil, proxyJump: proxyJump
+            forwardTarget: policy == .tunnelEntry ? forward?.localAddress : nil,
+            forwardNode: policy == .tunnelEntry ? forward?.nodeID : nil, proxyJump: proxyJump
         ))
         updated.sort { $0.hostAlias.localizedStandardCompare($1.hostAlias) == .orderedAscending }
         if proxyJump != nil {
@@ -318,8 +319,18 @@ final class SSHSyncModel: ObservableObject {
         settings.mappings[index].policy = policy
         if policy == .tunnelEntry, settings.mappings[index].forwardTarget == nil {
             let forwards = device(for: mapping)?.forwards ?? []
-            settings.mappings[index].forwardTarget = (forwards.first { $0.localAddress.hasSuffix(":22") } ?? forwards.first)?.localAddress
+            let forward = forwards.first { $0.localAddress.hasSuffix(":22") } ?? forwards.first
+            settings.mappings[index].forwardTarget = forward?.localAddress
+            settings.mappings[index].forwardNode = forward?.nodeID
         }
+        saveSettings()
+    }
+
+    /// Like the address type, this takes effect at the next update.
+    func setForward(_ forward: NetbridgeForward, for mapping: SSHMapping) {
+        guard let index = settings.mappings.firstIndex(where: { $0.id == mapping.id }) else { return }
+        settings.mappings[index].forwardTarget = forward.localAddress
+        settings.mappings[index].forwardNode = forward.nodeID
         saveSettings()
     }
 
@@ -389,7 +400,7 @@ final class SSHSyncModel: ObservableObject {
         guard FileManager.default.fileExists(atPath: settingsURL.path) else { return }
         do {
             settings = try JSONDecoder().decode(SSHSyncSettings.self, from: Data(contentsOf: settingsURL))
-            let merged = mergeUngroupedJumpOnly(settings.mappings)
+            let merged = assigningDefaultForwardNode(mergeUngroupedJumpOnly(settings.mappings))
             if merged != settings.mappings {
                 settings.mappings = merged
                 saveSettings()

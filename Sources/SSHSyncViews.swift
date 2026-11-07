@@ -352,6 +352,7 @@ struct SSHSyncView: View {
                 ForEach(SSHAddressPolicy.allCases) { Text($0.title).tag($0) }
             }
             .labelsHidden().controlSize(.small).frame(width: 135)
+            if mapping.policy == .tunnelEntry { entryPicker(mapping) }
             jumpButton(mapping)
             addressColumn(mapping)
             Spacer(minLength: 6)
@@ -360,6 +361,24 @@ struct SSHSyncView: View {
                 .buttonStyle(.plain).foregroundStyle(.secondary).help("移除")
         }
         .padding(.horizontal, 17).padding(.vertical, 11)
+    }
+
+    /// Lists what the device forwards now, plus the chosen one if its tunnel is down.
+    private func entryPicker(_ mapping: SSHMapping) -> some View {
+        let forwards = sync.device(for: mapping)?.forwards ?? []
+        let chosen = "\(mapping.forwardNode ?? "")|\(mapping.forwardTarget ?? "")"
+        return Picker("", selection: Binding(
+            get: { chosen },
+            set: { id in
+                if let forward = forwards.first(where: { $0.id == id }) { sync.setForward(forward, for: mapping) }
+            }
+        )) {
+            ForEach(forwards) { Text($0.title).tag($0.id) }
+            if !forwards.contains(where: { $0.id == chosen }) {
+                Text("\(mapping.forwardNode ?? "未选择") · \(mapping.forwardTarget ?? "—")（不在线）").tag(chosen)
+            }
+        }
+        .labelsHidden().controlSize(.small).frame(width: 150).help("netbridge 入口")
     }
 
     private func jumpLabel(_ mapping: SSHMapping) -> String {
@@ -675,7 +694,7 @@ struct SSHMappingEditor: View {
     @State private var deviceID = ""
     @State private var alias = ""
     @State private var policy = SSHAddressPolicy.lanIPv4
-    @State private var forwardTarget = ""
+    @State private var forwardID = ""
     @State private var error: String?
     @State private var hostSearch = ""
     @State private var highlightedHost: String?
@@ -693,10 +712,13 @@ struct SSHMappingEditor: View {
         }
     }
 
+    private var selectedForward: NetbridgeForward? { device?.forwards.first { $0.id == forwardID } }
+
     private var preview: String {
         guard let device else { return "—" }
         let mapping = SSHMapping(keyID: device.keyID, deviceLabel: device.label, hostAlias: alias, policy: policy,
-                                 forwardTarget: policy == .tunnelEntry ? forwardTarget : nil)
+                                 forwardTarget: policy == .tunnelEntry ? selectedForward?.localAddress : nil,
+                                 forwardNode: policy == .tunnelEntry ? selectedForward?.nodeID : nil)
         return resolveSSHTarget(mapping, device: device)?.display ?? "这台设备没有上报这类地址"
     }
 
@@ -720,10 +742,8 @@ struct SSHMappingEditor: View {
                         ForEach(SSHAddressPolicy.allCases) { Text($0.title).tag($0) }
                     }
                     if policy == .tunnelEntry {
-                        Picker("转发目标", selection: $forwardTarget) {
-                            ForEach(device?.forwards ?? []) {
-                                Text("\($0.localAddress)（\($0.publicAddress)）").tag($0.localAddress)
-                            }
+                        Picker("netbridge 入口", selection: $forwardID) {
+                            ForEach(device?.forwards ?? []) { Text($0.title).tag($0.id) }
                         }
                     }
                     LabeledContent("将写入") {
@@ -756,7 +776,7 @@ struct SSHMappingEditor: View {
                     } else {
                         guard let device else { return }
                         error = sync.addMapping(device: device, alias: alias, policy: policy,
-                                                forwardTarget: forwardTarget.isEmpty ? nil : forwardTarget,
+                                                forward: selectedForward,
                                                 proxyJump: proxyJump)
                     }
                     if error == nil { dismiss() }
@@ -862,7 +882,7 @@ struct SSHMappingEditor: View {
 
     private func selectDefaultForward() {
         let forwards = device?.forwards ?? []
-        forwardTarget = (forwards.first { $0.localAddress.hasSuffix(":22") } ?? forwards.first)?.localAddress ?? ""
+        forwardID = (forwards.first { $0.localAddress.hasSuffix(":22") } ?? forwards.first)?.id ?? ""
     }
 }
 

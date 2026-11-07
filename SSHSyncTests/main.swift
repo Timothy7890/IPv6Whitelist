@@ -52,6 +52,45 @@ require(devices.map(\.label) == ["LXZ-606", "WIN-5070"], "devices are grouped by
 let lxz = devices[0], win = devices[1]
 require(win.forwards.map(\.localAddress) == ["127.0.0.1:22", "127.0.0.1:15900"], "forwards are merged and sorted")
 
+// One device forwarding through two nodes.
+let multiNodeJSON = """
+[
+ {"id":"a","node_id":"ali","key_id":"k9","client_label":"Starry","client_address":"1.1.1.1:1","local_address":"127.0.0.1:22",
+  "public_address":"8.136.105.252:20011","active_connections":0,"created_at":"2026-11-05T04:15:43Z"},
+ {"id":"h","node_id":"home-1","key_id":"k9","client_label":"Starry","client_address":"1.1.1.1:2","local_address":"127.0.0.1:22",
+  "public_address":"home-1.xin0930.xyz:20100","access_address":"[240e:390:7052:7ce0::1]:20100",
+  "active_connections":0,"created_at":"2026-11-05T04:15:44Z"},
+ {"id":"s","node_id":"home-2","key_id":"k9","client_label":"Starry","client_address":"1.1.1.1:3","local_address":"127.0.0.1:22",
+  "public_address":"home-2.xin0930.xyz:20200","access_address":"[240e:390:7052:7ce0::2]:20200","access_stale":true,
+  "active_connections":0,"created_at":"2026-11-05T04:15:45Z"},
+ {"id":"n","node_id":"home-3","key_id":"k9","client_label":"Starry","client_address":"1.1.1.1:4","local_address":"127.0.0.1:22",
+  "public_address":"home-3.xin0930.xyz:20300","access_stale":true,"active_connections":0,"created_at":"2026-11-05T04:15:46Z"}
+]
+"""
+let starry = groupNetbridgeDevices(try JSONDecoder().decode([NetbridgeTunnel].self, from: Data(multiNodeJSON.utf8)))[0]
+require(starry.forwards.map(\.nodeID) == ["ali", "home-1", "home-2", "home-3"], "the same target on two nodes stays apart")
+require(Set(starry.forwards.map(\.id)).count == 4, "forward ids are unique across nodes")
+func onNode(_ node: String?) -> SSHMapping {
+    SSHMapping(keyID: "k9", deviceLabel: "Starry", hostAlias: "s", policy: .tunnelEntry, forwardTarget: "127.0.0.1:22", forwardNode: node)
+}
+require(resolveSSHTarget(onNode("ali"), device: starry) == SSHTarget(hostName: "8.136.105.252", port: 20011), "ali entry")
+require(resolveSSHTarget(onNode("home-1"), device: starry) == SSHTarget(hostName: "240e:390:7052:7ce0::1", port: 20100), "resolved IPv6 is used, not the domain")
+require(resolveSSHTarget(onNode("home-2"), device: starry) == SSHTarget(hostName: "240e:390:7052:7ce0::2", port: 20200), "last known address stays usable")
+require(starry.forwards[2].stale && starry.forwards[2].title.contains("解析失败"), "a failed lookup is shown")
+require(resolveSSHTarget(onNode("home-3"), device: starry) == SSHTarget(hostName: "home-3.xin0930.xyz", port: 20300), "unresolved falls back to the node's own entry")
+require(resolveSSHTarget(onNode("gone"), device: starry) == nil, "a node that is down does not move the Host elsewhere")
+require(starry.forwards[1].title == "home-1 · 22 → [240e:390:7052:7ce0::1]:20100", "entry title")
+var oldEntry = onNode(nil)
+let migrated = assigningDefaultForwardNode([oldEntry, SSHMapping(keyID: "k", deviceLabel: "d", hostAlias: "lan", policy: .lanIPv4)])
+require(migrated[0].forwardNode == "ali", "old tunnel mappings belong to ali")
+require(migrated[1].forwardNode == nil, "other mappings are left alone")
+oldEntry.forwardNode = "home-1"
+require(assigningDefaultForwardNode([oldEntry])[0].forwardNode == "home-1", "a chosen node is kept")
+let oldSaved = #"{"id":"00000000-0000-0000-0000-000000000001","keyID":"k","deviceLabel":"d","hostAlias":"a","policy":"tunnelEntry","forwardTarget":"127.0.0.1:22"}"#
+require(try JSONDecoder().decode(SSHMapping.self, from: Data(oldSaved.utf8)).forwardNode == nil, "settings from before nodes still load")
+var ipv6Entry = onNode("home-1"); ipv6Entry.applied = resolveSSHTarget(ipv6Entry, device: starry)
+require(dynamicWhitelistAddresses([ipv6Entry]).count == 1, "the node's IPv6 goes on the whitelist")
+
 func mapping(_ device: NetbridgeDevice, _ alias: String, _ policy: SSHAddressPolicy, forward: String? = nil) -> SSHMapping {
     SSHMapping(keyID: device.keyID, deviceLabel: device.label, hostAlias: alias, policy: policy, forwardTarget: forward)
 }

@@ -17,6 +17,10 @@ struct NetbridgeTunnel: Codable {
     var deviceHostname: String?
     var localAddress: String
     var publicAddress: String
+    /// Set by the Controller for nodes reached through an access domain.
+    var accessAddress: String?
+    var accessStale: Bool?
+    var nodeID: String?
     var createdAt: String
     var deviceAddressInfo: [NetbridgeAddress]?
 
@@ -27,15 +31,29 @@ struct NetbridgeTunnel: Codable {
         case deviceHostname = "device_hostname"
         case localAddress = "local_address"
         case publicAddress = "public_address"
+        case accessAddress = "access_address"
+        case accessStale = "access_stale"
+        case nodeID = "node_id"
         case createdAt = "created_at"
         case deviceAddressInfo = "device_address_info"
     }
 }
 
 struct NetbridgeForward: Equatable, Identifiable {
+    var nodeID: String
     var localAddress: String
+    /// The address to connect to: the resolved one when the node has it.
     var publicAddress: String
-    var id: String { localAddress }
+    /// The node's domain failed to resolve, so this is the last known address.
+    var stale: Bool = false
+    var id: String { "\(nodeID)|\(localAddress)" }
+
+    /// For example: home-1 · 22 → [240e::1]:20100
+    var title: String {
+        let target = localAddress.hasPrefix("127.0.0.1:") ? String(localAddress.dropFirst("127.0.0.1:".count)) : localAddress
+        let node = nodeID.isEmpty ? "" : "\(nodeID) · "
+        return "\(node)\(target) → \(publicAddress)\(stale ? "（解析失败）" : "")"
+    }
 }
 
 /// One authorized key. Identified by key rather than name because the name is
@@ -69,14 +87,23 @@ func groupNetbridgeDevices(_ tunnels: [NetbridgeTunnel]) -> [NetbridgeDevice] {
         )
         // A session that just connected may not have reported its addresses yet.
         if device.addresses.isEmpty { device.addresses = tunnel.deviceAddressInfo ?? [] }
-        if !device.forwards.contains(where: { $0.localAddress == tunnel.localAddress }) {
-            device.forwards.append(NetbridgeForward(localAddress: tunnel.localAddress, publicAddress: tunnel.publicAddress))
+        let nodeID = tunnel.nodeID ?? ""
+        if !device.forwards.contains(where: { $0.localAddress == tunnel.localAddress && $0.nodeID == nodeID }) {
+            device.forwards.append(NetbridgeForward(
+                nodeID: nodeID,
+                localAddress: tunnel.localAddress,
+                publicAddress: tunnel.accessAddress.flatMap { $0.isEmpty ? nil : $0 } ?? tunnel.publicAddress,
+                stale: tunnel.accessStale ?? false
+            ))
         }
         devices[tunnel.keyID] = device
     }
     return devices.values.map { device in
         var device = device
-        device.forwards.sort { $0.localAddress.localizedStandardCompare($1.localAddress) == .orderedAscending }
+        device.forwards.sort {
+            let byTarget = $0.localAddress.localizedStandardCompare($1.localAddress)
+            return byTarget == .orderedSame ? $0.nodeID.localizedStandardCompare($1.nodeID) == .orderedAscending : byTarget == .orderedAscending
+        }
         return device
     }.sorted { $0.label.localizedStandardCompare($1.label) == .orderedAscending }
 }
@@ -116,6 +143,8 @@ struct SSHMapping: Codable, Equatable, Identifiable {
     var policy: SSHAddressPolicy
     /// The B-side target such as 127.0.0.1:22. Used only with tunnelEntry.
     var forwardTarget: String?
+    /// The node of that target, since one device can forward it through several.
+    var forwardNode: String?
     /// What the generated file currently says, kept while the device is offline.
     var applied: SSHTarget?
     /// nil keeps the main config's value, sshProxyJumpNone connects directly,
@@ -168,6 +197,16 @@ func sshMappingRows(_ mappings: [SSHMapping]) -> [SSHMappingRow] {
         }
     }
     return rows
+}
+
+/// Mappings saved when ali was the only node.
+func assigningDefaultForwardNode(_ mappings: [SSHMapping]) -> [SSHMapping] {
+    mappings.map { mapping in
+        guard mapping.policy == .tunnelEntry, mapping.forwardTarget != nil, mapping.forwardNode == nil else { return mapping }
+        var mapping = mapping
+        mapping.forwardNode = "ali"
+        return mapping
+    }
 }
 
 /// Jump-only Hosts saved before groups existed: the same jump becomes one group.
@@ -284,7 +323,10 @@ func resolveSSHTarget(_ mapping: SSHMapping, device: NetbridgeDevice) -> SSHTarg
     case .lanIPv4: kind = "lan-ipv4"
     case .publicIPv6: kind = "public-ipv6"
     case .tunnelEntry:
-        guard let forward = device.forwards.first(where: { $0.localAddress == mapping.forwardTarget }) else { return nil }
+        // Never falls back to another node: a tunnel that is down must not move the Host.
+        guard let forward = device.forwards.first(where: {
+            $0.localAddress == mapping.forwardTarget && (mapping.forwardNode == nil || $0.nodeID == mapping.forwardNode)
+        }) else { return nil }
         return parseNetbridgeEntry(forward.publicAddress)
     }
     guard let address = device.addresses.first(where: { $0.kind == kind && $0.primary }),
